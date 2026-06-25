@@ -5,6 +5,7 @@ from firebase_config import db
 from services.ocr_service import extract_text_from_image
 from services.parse_service import parse_prescription_text
 from services.schedule_service import generate_times
+from services.allergy_service import check_allergy_warning
 
 router = APIRouter(
     prefix="/ocr",
@@ -68,10 +69,15 @@ async def ocr_prescription_and_save(
             total_count = daily_count * period * dosage
 
             doc_ref = db.collection("schedules").document()
+            medicine_name = medicine.get("medicineName")
 
+            allergy_warning = check_allergy_warning(
+            user_id=userId,
+            medicine_name=medicine_name
+            )
             schedule_data = {
                 "userId": userId,
-                "medicineName": medicine.get("medicineName"),
+                "medicineName": medicine_name,
                 "dailyCount": daily_count,
                 "times": times,
                 "dosage": dosage,
@@ -85,6 +91,8 @@ async def ocr_prescription_and_save(
                 "source": "OCR",
                 "createdAt": datetime.now().isoformat()
             }
+            if allergy_warning:
+                schedule_data["allergyWarning"] = allergy_warning
 
             doc_ref.set(schedule_data)
 

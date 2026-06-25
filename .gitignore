@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+.env
+
+# Firebase service account key
+serviceAccountKey.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test uploads
+uploads/

@@ -15,6 +15,26 @@ router = APIRouter(
 # 복용 완료 처리 API
 @router.post("/taken")
 def mark_as_taken(data: TakenLogRequest):
+    # 0. 중복 복용 기록 확인
+    # 같은 사용자, 같은 복약 일정, 같은 날짜, 같은 시간에 이미 복용 기록이 있는지 확인
+    existing_logs = (
+        db.collection("medicationLogs")
+        .where("userId", "==", data.userId)
+        .where("scheduleId", "==", data.scheduleId)
+        .where("date", "==", data.date)
+        .where("time", "==", data.time)
+        .stream()
+    )
+
+    for log in existing_logs:
+        existing_log_data = log.to_dict()
+
+        return {
+            "success": False,
+            "message": "이미 복용 완료된 기록입니다.",
+            "logId": log.id,
+            "log": existing_log_data
+        }
     # 1. 복용 기록 저장
     log_ref = db.collection("medicationLogs").document()
 

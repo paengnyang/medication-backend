@@ -66,13 +66,26 @@ def mark_as_taken(data: TakenLogRequest):
         schedule_ref.update({
             "remainingCount": new_remaining
         })
+        # 3. 약 부족 알림 판단
+        low_stock_warning = None
 
-        return {
+        if new_remaining == 0:
+            low_stock_warning = "약이 모두 소진되었습니다. 재처방 또는 구매가 필요합니다."
+        elif new_remaining <= 3:
+            low_stock_warning = "약이 부족합니다. 남은 약 개수를 확인해주세요."
+
+
+        response = {
             "success": True,
             "message": "복용 기록 저장 완료",
             "logId": log_ref.id,
             "remainingCount": new_remaining
         }
+    
+        if low_stock_warning:
+            response["warning"] = low_stock_warning
+
+        return response
 
     return {
         "success": False,

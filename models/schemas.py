@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # 복약 일정 생성 요청 데이터 형식
@@ -6,7 +6,7 @@ class ScheduleCreateRequest(BaseModel):
     userId: str
     medicineName: str
     dailyCount: int
-    dosage: int
+    dosage: float
     timing: str
     startDate: str
     endDate: str
@@ -23,8 +23,22 @@ class TakenLogRequest(BaseModel):
 
 # 사용자 생성 요청 데이터 형식
 class UserCreateRequest(BaseModel):
-    userId: str
-    name: str
     email: str
-    age: int
-    allergyList: list[str] = []
+    password: str
+    name: str
+    phone: str 
+
+    gender: str
+    pregnancy: str = ""
+
+    birthYear: str
+    birthMonth: str
+    birthDay: str
+
+    guardianPhone: str = ""
+    
+    allergyList: list[str] = Field(default_factory=list)
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str

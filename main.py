@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from firebase_config import db
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
 
 from routers.schedule import router as schedule_router
 from routers.log import router as log_router
@@ -13,7 +14,13 @@ app = FastAPI(
     description="AI 기반 개인 맞춤 복약 관리 시스템 백엔드 서버",
     version="1.0.0"
 )
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 개발 중에는 전체 허용
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # schedule.py와 log.py에 있는 API들을 main.py에 등록
 app.include_router(schedule_router)

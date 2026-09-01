@@ -2,61 +2,52 @@ import re
 
 
 def parse_prescription_text(text: str):
-    """
-    OCR 텍스트에서 약 이름, 하루 복용 횟수, 복용 기간, 복용량, 복용 시점을 간단히 추출한다.
-    """
-
     medicines = []
 
-    # 줄 단위로 분리
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
+    # 기본값
+    dosage = 1
+    daily_count = 1
+    period = 1
+    timing = "정보 없음"
+
+    # 1. 투약량 / 투여횟수 / 투약일수 표 찾기
+    # 예: 05 | 3 | 4
     for line in lines:
-        # 기본값
-        medicine_name = None
-        daily_count = None
-        period = None
-        dosage = 1
-        timing = "정보 없음"
+        clean_line = line.replace(" ", "")
 
-        # 1일 3회 추출
-        daily_match = re.search(r"1일\s*(\d+)회", line)
-        if daily_match:
-            daily_count = int(daily_match.group(1))
+        # 05 | 3 | 4 / 0.5 | 3 | 4 / 1 | 3 | 4 형태 처리
+        table_match = re.search(r"([0-9.]+)\|([0-9]+)\|([0-9]+)", clean_line)
 
-        # 7일분 추출
-        period_match = re.search(r"(\d+)일분", line)
-        if period_match:
-            period = int(period_match.group(1))
+        if table_match:
+            raw_dosage = table_match.group(1)
+            daily_count = int(table_match.group(2))
+            period = int(table_match.group(3))
 
-        # 1회 1정 추출
-        dosage_match = re.search(r"1회\s*(\d+)", line)
-        if dosage_match:
-            dosage = int(dosage_match.group(1))
+            # OCR에서 0.5가 05로 읽히는 경우 보정
+            if raw_dosage == "05":
+                dosage = 0.5
+            else:
+                dosage = float(raw_dosage)
 
-        # 식후/식전/취침 전 추출
-        if "식후" in line:
-            timing = "식후"
-        elif "식전" in line:
-            timing = "식전"
-        elif "취침" in line:
-            timing = "취침 전"
+            break
 
-        # 약 이름 추정
-        # 가장 단순하게는 줄의 첫 번째 단어를 약 이름으로 처리
-        words = line.split()
-        if len(words) > 0:
-            medicine_name = words[0]
+    # 2. 약 이름 추출
+    for line in lines:
+        # 예:
+        # 650204010 메드닌정(메틸프레드니솔론) (4070/1정)
+        # 642506080 크라모틴정(아목시실린:클라불란산칼륨(2:1))_(1정)
 
-        # 복용 횟수나 기간이 있는 줄만 약 정보로 판단
-        if medicine_name and (daily_count or period):
-            if daily_count is None:
-                daily_count = 1
+        medicine_match = re.search(
+            r"^\d{8,9}\s+([가-힣A-Za-z0-9]+(?:정|캡슐|시럽|액|주|연고|크림))",
+            line
+        )
 
-            if period is None:
-                period = 1
+        if medicine_match:
+            medicine_name = medicine_match.group(1)
 
-            total_count = daily_count * period * dosage
+            total_count = dosage * daily_count * period
 
             medicines.append({
                 "medicineName": medicine_name,

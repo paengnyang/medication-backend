@@ -7,6 +7,8 @@ from routers.schedule import router as schedule_router
 from routers.log import router as log_router
 from routers.user import router as user_router
 from routers.ocr import router as ocr_router
+from routers.stock import router as stock_router
+
 
 
 app = FastAPI(
@@ -27,6 +29,7 @@ app.include_router(schedule_router)
 app.include_router(log_router)
 app.include_router(user_router)
 app.include_router(ocr_router)
+app.include_router(stock_router)
 
 @app.get("/")
 def root():

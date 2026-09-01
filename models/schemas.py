@@ -42,3 +42,19 @@ class UserCreateRequest(BaseModel):
 class UserLoginRequest(BaseModel):
     email: str
     password: str
+
+class StockCreateRequest(BaseModel):
+    userId: str
+    medicineName: str
+    remainingCount: int
+    setSize: int
+
+
+class StockConsumeRequest(BaseModel):
+    userId: str
+    stockId: str
+
+
+class StockAddSetRequest(BaseModel):
+    userId: str
+    stockId: str

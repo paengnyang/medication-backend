@@ -15,6 +15,9 @@ from routers.safety import (
 from routers.password_reset import (
     router as password_reset_router,
 )
+from routers.guardians import (
+    router as guardians_router,
+)
 
 
 
@@ -40,6 +43,7 @@ app.include_router(stock_router)
 app.include_router(drugs_router)
 app.include_router(safety_router)
 app.include_router(password_reset_router)
+app.include_router(guardians_router)
 
 @app.get("/")
 def root():

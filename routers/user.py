@@ -12,6 +12,9 @@ from services.password_service import (
     hash_password,
     verify_user_password,
 )
+from services.guardian_service import (
+    get_linked_guardian_phone,
+)
 
 
 router = APIRouter(
@@ -232,7 +235,16 @@ def get_user(
         "passwordHash",
         None
     )
+    linked_guardian_phone = (
+        get_linked_guardian_phone(
+            user_id
+        )
+    )
 
+    if linked_guardian_phone:
+        user_data[
+            "guardianPhone"
+        ] = linked_guardian_phone
     return {
         "success":
             True,

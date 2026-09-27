@@ -8,6 +8,10 @@ from routers.log import router as log_router
 from routers.user import router as user_router
 from routers.ocr import router as ocr_router
 from routers.stock import router as stock_router
+from routers.drugs import router as drugs_router
+from routers.safety import (
+    router as safety_router,
+)
 
 
 
@@ -30,6 +34,8 @@ app.include_router(log_router)
 app.include_router(user_router)
 app.include_router(ocr_router)
 app.include_router(stock_router)
+app.include_router(drugs_router)
+app.include_router(safety_router)
 
 @app.get("/")
 def root():

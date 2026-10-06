@@ -2,6 +2,7 @@ import html
 import json
 import os
 import re
+from datetime import date
 from urllib.parse import quote
 from urllib.parse import (
     quote,
@@ -43,6 +44,15 @@ DUR_API_URL = (
     "getUsjntTabooInfoList03"
 )
 
+DUR_BASE_URL = (
+    "https://apis.data.go.kr/"
+    "1471000/"
+    "DURPrdlstInfoService03"
+)
+
+DUR_AGE_ENDPOINT = (
+    "getSpcifyAgrdeTabooInfoList03"
+)
 # 기존 식약처 API 키를 그대로 사용할 수 있게
 # 여러 이름을 fallback으로 확인한다.
 DUR_API_KEY = (
@@ -53,7 +63,7 @@ DUR_API_KEY = (
     or os.getenv("SERVICE_KEY")
     or ""
 ).strip()
-
+_dur_dataset_cache = {}
 # Encoding 키를 저장해둔 경우
 # urlencode에서 이중 인코딩되지 않도록 한 번 decode
 DUR_API_KEY = unquote(
@@ -418,6 +428,684 @@ def _extract_dur_items(data):
         ]
 
     return []
+
+def _extract_dur_total_count(
+    data
+):
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return 0
+
+    response = data.get(
+        "response"
+    )
+
+    if isinstance(
+        response,
+        dict,
+    ):
+        body = response.get(
+            "body"
+        )
+    else:
+        body = data.get(
+            "body"
+        )
+
+    if not isinstance(
+        body,
+        dict,
+    ):
+        return 0
+
+    try:
+        return int(
+            body.get(
+                "totalCount",
+                0,
+            )
+            or 0
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 0
+
+def _load_dur_dataset(
+    endpoint_name
+):
+    """
+    DUR 데이터를 전부 받아 캐시에 저장한다.
+
+    같은 서버 실행 중에는
+    두 번째부터 API를 다시 호출하지 않는다.
+    """
+
+    cached = (
+        _dur_dataset_cache.get(
+            endpoint_name
+        )
+    )
+
+    if cached is not None:
+        return {
+            "success": True,
+            "items": cached,
+            "error": None,
+        }
+
+    if not DUR_API_KEY:
+        return {
+            "success": False,
+            "items": [],
+            "error":
+                "DUR API 인증키가 없습니다.",
+        }
+
+    page = 1
+    page_size = 1000
+
+    all_items = []
+
+    try:
+        while True:
+
+            params = {
+                "serviceKey":
+                    DUR_API_KEY,
+
+                "type":
+                    "json",
+
+                "pageNo":
+                    page,
+
+                "numOfRows":
+                    page_size,
+            }
+
+            url = (
+                f"{DUR_BASE_URL}/"
+                f"{endpoint_name}"
+                f"?{urlencode(params)}"
+            )
+
+            print(
+                "[DUR DATASET]",
+                endpoint_name,
+                "page:",
+                page,
+            )
+
+            with urlopen(
+                url,
+                timeout=30,
+            ) as response:
+
+                body = (
+                    response
+                    .read()
+                    .decode(
+                        "utf-8"
+                    )
+                )
+
+            data = json.loads(
+                body
+            )
+
+            items = (
+                _extract_dur_items(
+                    data
+                )
+            )
+
+            total_count = (
+                _extract_dur_total_count(
+                    data
+                )
+            )
+
+            all_items.extend(
+                items
+            )
+
+            print(
+                "[DUR DATASET]",
+                len(all_items),
+                "/",
+                total_count,
+            )
+
+            if not items:
+                break
+
+            if (
+                total_count > 0
+                and len(all_items)
+                >= total_count
+            ):
+                break
+
+            if len(items) < page_size:
+                break
+
+            page += 1
+
+            # 비정상 응답으로 무한루프 방지
+            if page > 100:
+                break
+
+        _dur_dataset_cache[
+            endpoint_name
+        ] = all_items
+
+        return {
+            "success": True,
+            "items": all_items,
+            "error": None,
+        }
+
+    except Exception as e:
+
+        print(
+            "[DUR DATASET ERROR]",
+            endpoint_name,
+            str(e),
+        )
+
+        return {
+            "success": False,
+            "items": [],
+            "error": str(e),
+        }
+
+def _dur_item_matches_drug(
+    item,
+    medicine_name,
+    ingredients,
+):
+    """
+    DUR 데이터가 현재 약에 해당하는지 확인.
+    """
+
+    target_name = (
+        _normalize_for_match(
+            medicine_name
+        )
+    )
+
+    dur_item_name = (
+        _normalize_for_match(
+            item.get(
+                "ITEM_NAME"
+            )
+        )
+    )
+
+    # 제품명이 정확히 같은 경우
+    if (
+        target_name
+        and dur_item_name
+        and target_name
+        == dur_item_name
+    ):
+        return True
+
+    # --------------------------------
+    # 성분명으로 한 번 더 확인
+    # --------------------------------
+
+    dur_ingredient = (
+        item.get("INGR_NAME")
+        or item.get(
+            "INGR_KOR_NAME"
+        )
+        or ""
+    )
+
+    dur_ingredient = (
+        _normalize_for_match(
+            dur_ingredient
+        )
+    )
+
+    if not dur_ingredient:
+        return False
+
+    for ingredient in ingredients:
+
+        normalized = (
+            _normalize_for_match(
+                ingredient
+            )
+        )
+
+        if not normalized:
+            continue
+
+        if (
+            normalized
+            == dur_ingredient
+        ):
+            return True
+
+    return False
+
+def _get_user_age(
+    user_id
+):
+    """
+    Firestore users/{userId}의
+    생년월일로 만 나이를 계산.
+    """
+
+    try:
+        user_doc = (
+            db.collection(
+                "users"
+            )
+            .document(
+                user_id
+            )
+            .get()
+        )
+
+        if not user_doc.exists:
+            return None
+
+        user = (
+            user_doc.to_dict()
+            or {}
+        )
+
+        year = int(
+            user.get(
+                "birthYear"
+            )
+        )
+
+        month = int(
+            user.get(
+                "birthMonth"
+            )
+        )
+
+        day = int(
+            user.get(
+                "birthDay"
+            )
+        )
+
+        birth_date = date(
+            year,
+            month,
+            day,
+        )
+
+        today = date.today()
+
+        age = (
+            today.year
+            - birth_date.year
+            - (
+                (
+                    today.month,
+                    today.day,
+                )
+                <
+                (
+                    birth_date.month,
+                    birth_date.day,
+                )
+            )
+        )
+
+        # 개월 수도 계산
+        months = (
+            (
+                today.year
+                - birth_date.year
+            )
+            * 12
+            + today.month
+            - birth_date.month
+        )
+
+        if (
+            today.day
+            < birth_date.day
+        ):
+            months -= 1
+
+        return {
+            "age":
+                age,
+
+            "ageMonths":
+                max(
+                    months,
+                    0,
+                ),
+
+            "birthDate":
+                birth_date.isoformat(),
+        }
+
+    except Exception as e:
+
+        print(
+            "[DUR AGE]"
+            " 사용자 나이 계산 실패:",
+            str(e),
+        )
+
+        return None
+
+def _age_rule_applies(
+    age,
+    age_months,
+    text,
+):
+    """
+    DUR 금기 문구에서 숫자 연령을 읽어
+    사용자가 해당되는지 검사한다.
+
+    반환:
+        True  -> 해당 금기
+        False -> 해당하지 않음
+        None  -> 자동 판정 불가
+    """
+
+    text = _safe_string(
+        text
+    )
+
+    if not text:
+        return None
+
+    # =================================
+    # 개월 기준
+    # =================================
+
+    match = re.search(
+        r"(\d+)\s*개월\s*미만",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return (
+            age_months
+            < limit
+        )
+
+    match = re.search(
+        r"(\d+)\s*개월\s*이하",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return (
+            age_months
+            <= limit
+        )
+
+    # =================================
+    # 세 기준
+    # =================================
+
+    match = re.search(
+        r"(\d+)\s*세\s*미만",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return age < limit
+
+    match = re.search(
+        r"(\d+)\s*세\s*이하",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return age <= limit
+
+    match = re.search(
+        r"(\d+)\s*세\s*초과",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return age > limit
+
+    match = re.search(
+        r"(\d+)\s*세\s*이상",
+        text,
+    )
+
+    if match:
+        limit = int(
+            match.group(1)
+        )
+        return age >= limit
+
+    # 소아/영아처럼
+    # 정확한 숫자가 없는 경우
+    return None
+
+def _check_age_dur(
+    user_id,
+    medicine_name,
+    ingredients,
+):
+    age_info = (
+        _get_user_age(
+            user_id
+        )
+    )
+
+    if age_info is None:
+        return {
+            "success": False,
+            "age": None,
+            "warnings": [],
+            "reviewRules": [],
+            "error":
+                "사용자 생년월일을 "
+                "확인할 수 없습니다.",
+        }
+
+    dataset = (
+        _load_dur_dataset(
+            DUR_AGE_ENDPOINT
+        )
+    )
+
+    if not dataset.get(
+        "success"
+    ):
+        return {
+            "success": False,
+            "age":
+                age_info["age"],
+            "warnings": [],
+            "reviewRules": [],
+            "error":
+                dataset.get(
+                    "error"
+                ),
+        }
+
+    matched_items = []
+
+    for item in dataset.get(
+        "items",
+        [],
+    ):
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if _dur_item_matches_drug(
+            item,
+            medicine_name,
+            ingredients,
+        ):
+            matched_items.append(
+                item
+            )
+
+    warnings = []
+    review_rules = []
+
+    for item in matched_items:
+
+        content = (
+            _safe_string(
+                item.get(
+                    "PROHBT_CONTENT"
+                )
+            )
+        )
+
+        remark = (
+            _safe_string(
+                item.get(
+                    "REMARK"
+                )
+            )
+        )
+
+        rule_text = (
+            f"{content} {remark}"
+        ).strip()
+
+        applies = (
+            _age_rule_applies(
+                age_info["age"],
+                age_info[
+                    "ageMonths"
+                ],
+                rule_text,
+            )
+        )
+
+        warning = {
+            "type":
+                "dur_age_contraindication",
+
+            "severity":
+                "danger",
+
+            "medicineName":
+                medicine_name,
+
+            "ingredient":
+                (
+                    item.get(
+                        "INGR_NAME"
+                    )
+                    or item.get(
+                        "INGR_KOR_NAME"
+                    )
+                    or ""
+                ),
+
+            "userAge":
+                age_info["age"],
+
+            "prohibition":
+                content,
+
+            "remark":
+                remark,
+
+            "notificationDate":
+                _safe_string(
+                    item.get(
+                        "NOTIFICATION_DATE"
+                    )
+                ),
+        }
+
+        if applies is True:
+
+            warning["message"] = (
+                f"현재 사용자는 만 "
+                f"{age_info['age']}세이며, "
+                f"{medicine_name}은 "
+                "식약처 DUR 특정연령대 "
+                "금기에 해당합니다."
+            )
+
+            warnings.append(
+                warning
+            )
+
+        elif applies is None:
+
+            warning[
+                "severity"
+            ] = "review"
+
+            warning[
+                "message"
+            ] = (
+                "특정연령대 금기 정보가 "
+                "있지만 자동으로 정확한 "
+                "연령 조건을 판정할 수 "
+                "없는 문구입니다."
+            )
+
+            review_rules.append(
+                warning
+            )
+
+    return {
+        "success": True,
+
+        "age":
+            age_info["age"],
+
+        "ageMonths":
+            age_info[
+                "ageMonths"
+            ],
+
+        "matchedRuleCount":
+            len(
+                matched_items
+            ),
+
+        "warnings":
+            warnings,
+
+        "reviewRules":
+            review_rules,
+
+        "error": None,
+    }
 
 def _call_dur_interaction_api(
     drug_a,
@@ -1257,6 +1945,28 @@ def check_drug_interactions(
         )
     )
 
+    age_result = (
+        _check_age_dur(
+            user_id,
+            candidate_name,
+            candidate_ingredients,
+        )
+    )
+
+    age_warnings = (
+        age_result.get(
+            "warnings",
+            [],
+        )
+    )
+
+    age_review_rules = (
+        age_result.get(
+            "reviewRules",
+            [],
+        )
+    )
+
     candidate_precautions = (
         candidate.get(
             "precautions"
@@ -1731,7 +2441,8 @@ def check_drug_interactions(
     
     has_warning = (
         len(unique_warnings) > 0 or
-        len(unique_dur_warnings) > 0
+        len(unique_dur_warnings) > 0 or
+        len(age_warnings) > 0
     )
 
 
@@ -1792,6 +2503,39 @@ def check_drug_interactions(
 
         "durErrors":
             dur_errors,
+        # =====================================
+        # 특정연령대금기
+        # =====================================
+
+        "ageCheck": {
+            "success":
+                age_result.get(
+                    "success",
+                    False,
+                ),
+
+            "userAge":
+                age_result.get(
+                    "age"
+                ),
+
+            "matchedRuleCount":
+                age_result.get(
+                    "matchedRuleCount",
+                    0,
+                ),
+
+            "error":
+                age_result.get(
+                    "error"
+                ),
+        },
+
+        "ageWarnings":
+            age_warnings,
+
+        "ageReviewRules":
+            age_review_rules,
 
         # '안전'이라고 판정하지 않는다.
         "screeningStatus":

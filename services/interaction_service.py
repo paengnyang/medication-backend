@@ -53,6 +53,9 @@ DUR_BASE_URL = (
 DUR_AGE_ENDPOINT = (
     "getSpcifyAgrdeTabooInfoList03"
 )
+DUR_PREGNANCY_ENDPOINT = (
+    "getPwnmTabooInfoList03"
+)
 # 기존 식약처 API 키를 그대로 사용할 수 있게
 # 여러 이름을 fallback으로 확인한다.
 DUR_API_KEY = (
@@ -714,6 +717,7 @@ def _get_user_age(
             )
             .get()
         )
+        
 
         if not user_doc.exists:
             return None
@@ -805,6 +809,382 @@ def _get_user_age(
         )
 
         return None
+
+def _get_user_pregnancy_status(
+    user_id
+):
+    """
+    Firestore users/{userId}의
+    임신 여부를 읽는다.
+
+    반환:
+        True  -> 임신
+        False -> 비임신
+        None  -> 정보 없음
+    """
+
+    try:
+        user_doc = (
+            db.collection(
+                "users"
+            )
+            .document(
+                user_id
+            )
+            .get()
+        )
+
+        if not user_doc.exists:
+            return {
+                "pregnant": None,
+                "gender": "",
+                "rawValue": None,
+            }
+
+        user = (
+            user_doc.to_dict()
+            or {}
+        )
+
+        pregnancy = user.get(
+            "pregnancy"
+        )
+
+        gender = _safe_string(
+            user.get(
+                "gender"
+            )
+        )
+
+        # bool로 저장된 경우
+        if isinstance(
+            pregnancy,
+            bool,
+        ):
+            return {
+                "pregnant":
+                    pregnancy,
+
+                "gender":
+                    gender,
+
+                "rawValue":
+                    pregnancy,
+            }
+
+        value = (
+            _safe_string(
+                pregnancy
+            )
+            .lower()
+        )
+
+        # 현재 Flutter에서 사용하는 O
+        if value in {
+            "o",
+            "yes",
+            "y",
+            "true",
+            "1",
+            "임신",
+        }:
+            return {
+                "pregnant": True,
+                "gender": gender,
+                "rawValue": pregnancy,
+            }
+
+        # 현재 Flutter에서 사용하는 X
+        if value in {
+            "x",
+            "no",
+            "n",
+            "false",
+            "0",
+            "비임신",
+        }:
+            return {
+                "pregnant": False,
+                "gender": gender,
+                "rawValue": pregnancy,
+            }
+
+        return {
+            "pregnant": None,
+            "gender": gender,
+            "rawValue": pregnancy,
+        }
+
+    except Exception as e:
+
+        print(
+            "[DUR PREGNANCY]"
+            " 사용자 정보 조회 실패:",
+            str(e),
+        )
+
+        return {
+            "pregnant": None,
+            "gender": "",
+            "rawValue": None,
+        }
+
+def _check_pregnancy_dur(
+    user_id,
+    medicine_name,
+    ingredients,
+):
+    """
+    사용자 임신 여부와
+    식약처 DUR 임부금기 데이터를 비교한다.
+    """
+
+    user_status = (
+        _get_user_pregnancy_status(
+            user_id
+        )
+    )
+
+    pregnant = (
+        user_status.get(
+            "pregnant"
+        )
+    )
+
+    gender = (
+        user_status.get(
+            "gender",
+            "",
+        )
+    )
+
+    # ========================================
+    # 임신 정보 자체가 없는 경우
+    # ========================================
+
+    if pregnant is None:
+        return {
+            "success": True,
+
+            "checked": False,
+
+            "pregnant": None,
+
+            "gender": gender,
+
+            "matchedRuleCount": 0,
+
+            "warnings": [],
+
+            "error": None,
+
+            "message":
+                "사용자의 임신 여부 정보가 "
+                "없어 임부금기 검사를 "
+                "적용하지 않았습니다.",
+        }
+
+    # ========================================
+    # 임신하지 않은 경우
+    # DUR 전체 데이터를 불러올 필요도 없음
+    # ========================================
+
+    if pregnant is False:
+        return {
+            "success": True,
+
+            "checked": True,
+
+            "pregnant": False,
+
+            "gender": gender,
+
+            "matchedRuleCount": 0,
+
+            "warnings": [],
+
+            "error": None,
+
+            "message":
+                "현재 사용자 정보상 "
+                "임신 상태가 아니므로 "
+                "임부금기 경고를 "
+                "적용하지 않았습니다.",
+        }
+
+    # ========================================
+    # 임신 상태인 경우만 DUR 조회
+    # ========================================
+
+    dataset = (
+        _load_dur_dataset(
+            DUR_PREGNANCY_ENDPOINT
+        )
+    )
+
+    if not dataset.get(
+        "success"
+    ):
+        return {
+            "success": False,
+
+            "checked": False,
+
+            "pregnant": True,
+
+            "gender": gender,
+
+            "matchedRuleCount": 0,
+
+            "warnings": [],
+
+            "error":
+                dataset.get(
+                    "error"
+                ),
+
+            "message":
+                "DUR 임부금기 데이터를 "
+                "조회하지 못했습니다.",
+        }
+
+    matched_items = []
+
+    for item in dataset.get(
+        "items",
+        [],
+    ):
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if _dur_item_matches_drug(
+            item,
+            medicine_name,
+            ingredients,
+        ):
+            matched_items.append(
+                item
+            )
+
+    warnings = []
+
+    for item in matched_items:
+
+        ingredient = (
+            _safe_string(
+                item.get(
+                    "INGR_NAME"
+                )
+            )
+            or
+            _safe_string(
+                item.get(
+                    "INGR_KOR_NAME"
+                )
+            )
+            or
+            _safe_string(
+                item.get(
+                    "MAIN_INGR"
+                )
+            )
+        )
+
+        prohibition = (
+            _safe_string(
+                item.get(
+                    "PROHBT_CONTENT"
+                )
+            )
+        )
+
+        remark = (
+            _safe_string(
+                item.get(
+                    "REMARK"
+                )
+            )
+        )
+
+        warnings.append(
+            {
+                "type":
+                    "dur_pregnancy_contraindication",
+
+                "severity":
+                    "danger",
+
+                "medicineName":
+                    medicine_name,
+
+                "ingredient":
+                    ingredient,
+
+                "ruleType":
+                    (
+                        _safe_string(
+                            item.get(
+                                "TYPE_NAME"
+                            )
+                        )
+                        or "임부금기"
+                    ),
+
+                "prohibition":
+                    prohibition,
+
+                "remark":
+                    remark,
+
+                "notificationDate":
+                    _safe_string(
+                        item.get(
+                            "NOTIFICATION_DATE"
+                        )
+                    ),
+
+                "message":
+                    (
+                        f"{medicine_name}은 "
+                        "식약처 DUR 임부금기 "
+                        "정보에 해당합니다."
+                    ),
+            }
+        )
+
+    return {
+        "success": True,
+
+        "checked": True,
+
+        "pregnant": True,
+
+        "gender": gender,
+
+        "matchedRuleCount":
+            len(
+                matched_items
+            ),
+
+        "warnings":
+            warnings,
+
+        "error": None,
+
+        "message":
+            (
+                "임부금기 정보가 "
+                "확인되었습니다."
+                if warnings
+                else
+                "해당 의약품의 DUR "
+                "임부금기 정보가 "
+                "확인되지 않았습니다."
+            ),
+    }
 
 def _age_rule_applies(
     age,
@@ -1967,6 +2347,21 @@ def check_drug_interactions(
         )
     )
 
+    pregnancy_result = (
+        _check_pregnancy_dur(
+            user_id,
+            candidate_name,
+            candidate_ingredients,
+        )
+    )
+
+    pregnancy_warnings = (
+        pregnancy_result.get(
+            "warnings",
+            [],
+        )
+    )
+
     candidate_precautions = (
         candidate.get(
             "precautions"
@@ -2442,7 +2837,8 @@ def check_drug_interactions(
     has_warning = (
         len(unique_warnings) > 0 or
         len(unique_dur_warnings) > 0 or
-        len(age_warnings) > 0
+        len(age_warnings) > 0 or
+        len(pregnancy_warnings) > 0
     )
 
 
@@ -2537,10 +2933,55 @@ def check_drug_interactions(
         "ageReviewRules":
             age_review_rules,
 
+        "pregnancyCheck": {
+            "success":
+                pregnancy_result.get(
+                    "success",
+                    False,
+                ),
+
+            "checked":
+                pregnancy_result.get(
+                    "checked",
+                    False,
+                ),
+
+            "pregnant":
+                pregnancy_result.get(
+                    "pregnant"
+                ),
+
+            "gender":
+                pregnancy_result.get(
+                    "gender",
+                    "",
+                ),
+
+            "matchedRuleCount":
+                pregnancy_result.get(
+                    "matchedRuleCount",
+                    0,
+                ),
+
+            "error":
+                pregnancy_result.get(
+                    "error"
+                ),
+        },
+
+        "pregnancyWarnings":
+            pregnancy_warnings,
+
         # '안전'이라고 판정하지 않는다.
         "screeningStatus":
             (
-                "dur_warning_found"
+                "pregnancy_contraindication"
+                if pregnancy_warnings
+
+                else "age_contraindication"
+                if age_warnings
+
+                else "dur_warning_found"
                 if unique_dur_warnings
 
                 else "warning_found"
@@ -2554,6 +2995,17 @@ def check_drug_interactions(
 
         "message":
             (
+                "사용자의 임신 상태와 관련된"
+                "DUR 임부금기가 확인되었습니다."
+                if pregnancy_warnings
+
+                else
+                "사용자의 연령과 관련된"
+                "DUR 특정연령대금기가"
+                "확인되었습니다."
+                if age_warnings
+
+                else
                 "식약처 DUR 병용금기가 "
                 "확인되었습니다."
                 if unique_dur_warnings
@@ -2567,6 +3019,7 @@ def check_drug_interactions(
                 "DUR 검사 중 일부 약의 "
                 "조회에 실패했습니다."
                 if dur_errors
+
                 else
                 "식약처 DUR에서 직접적인 "
                 "병용금기가 확인되지 않았습니다."

@@ -58,3 +58,8 @@ class StockConsumeRequest(BaseModel):
 class StockAddSetRequest(BaseModel):
     userId: str
     stockId: str
+
+class MedicationTimesUpdateRequest(BaseModel):
+    morning: str
+    lunch: str
+    dinner: str

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from datetime import (datetime, timedelta, timezone)
 import uuid
 
 from firebase_config import db
@@ -8,6 +8,7 @@ from models.schemas import (
     StockConsumeRequest,
     StockAddSetRequest,
 )
+
 
 router = APIRouter(
     prefix="/stocks",
@@ -95,12 +96,18 @@ def get_user_stocks(user_id: str):
     }
 
 
-# 알약 1개 사용
 @router.post("/consume")
-def consume_stock(data: StockConsumeRequest):
+def consume_stock(
+    data: StockConsumeRequest
+):
 
-    ref = db.collection("stockMedicines").document(
-        data.stockId
+    ref = (
+        db.collection(
+            "stockMedicines"
+        )
+        .document(
+            data.stockId
+        )
     )
 
     doc = ref.get()
@@ -108,36 +115,296 @@ def consume_stock(data: StockConsumeRequest):
     if not doc.exists:
         raise HTTPException(
             status_code=404,
-            detail="상비약을 찾을 수 없습니다."
+            detail=
+                "상비약을 찾을 수 없습니다."
         )
 
     stock = doc.to_dict()
 
-    # 다른 사용자의 약 수정 방지
-    if stock.get("userId") != data.userId:
+    # =================================
+    # 사용자 확인
+    # =================================
+
+    if stock.get(
+        "userId"
+    ) != data.userId:
         raise HTTPException(
             status_code=403,
-            detail="접근 권한이 없습니다."
+            detail=
+                "접근 권한이 없습니다."
         )
 
-    remaining = stock.get("remainingCount", 0)
+    remaining = int(
+        stock.get(
+            "remainingCount",
+            0,
+        )
+    )
 
     if remaining <= 0:
         return {
-            "success": False,
-            "message": "남은 약이 없습니다.",
-            "remainingCount": 0,
+            "success":
+                False,
+
+            "message":
+                "남은 약이 없습니다.",
+
+            "remainingCount":
+                0,
         }
 
-    remaining -= 1
+    # =================================
+    # 약 DB에서 얻은 최소 복용 간격
+    # =================================
 
-    ref.update({
-        "remainingCount": remaining,
-    })
+    min_interval_hours = int(
+        stock.get(
+            "minIntervalHours",
+            0,
+        )
+        or 0
+    )
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    # =================================
+    # 이전 복용 후 아직 간격이
+    # 지나지 않았는지 검사
+    # =================================
+
+    next_allowed_raw = stock.get(
+        "nextAllowedAt"
+    )
+
+    if (
+        min_interval_hours > 0
+        and next_allowed_raw
+    ):
+        try:
+            raw_text = str(
+                next_allowed_raw
+            ).replace(
+                "Z",
+                "+00:00",
+            )
+
+            next_allowed = (
+                datetime
+                .fromisoformat(
+                    raw_text
+                )
+            )
+
+            # 과거 데이터가
+            # timezone 없는 형식인 경우
+            if (
+                next_allowed.tzinfo
+                is None
+            ):
+                next_allowed = (
+                    next_allowed.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+
+            next_allowed_utc = (
+                next_allowed
+                .astimezone(
+                    timezone.utc
+                )
+            )
+
+            if (
+                now_utc
+                < next_allowed_utc
+            ):
+                seconds_left = int(
+                    (
+                        next_allowed_utc
+                        - now_utc
+                    )
+                    .total_seconds()
+                )
+
+                return {
+                    "success":
+                        False,
+
+                    "message":
+                        "아직 다음 복용 가능 시간이 아닙니다.",
+
+                    "remainingCount":
+                        remaining,
+
+                    "minIntervalHours":
+                        min_interval_hours,
+
+                    "nextAllowedAt":
+                        next_allowed_utc
+                        .isoformat(),
+
+                    "secondsUntilNext":
+                        seconds_left,
+                }
+
+        except (
+            ValueError,
+            TypeError,
+        ):
+            # 잘못된 예전 데이터면
+            # 복용 자체를 막지는 않음
+            pass
+
+    # =================================
+    # 복용 처리
+    # =================================
+
+    new_remaining = (
+        remaining - 1
+    )
+
+    next_allowed_at = None
+
+    if min_interval_hours > 0:
+        next_allowed_at = (
+            now_utc
+            + timedelta(
+                hours=
+                    min_interval_hours
+            )
+        )
+
+    update_data = {
+        "remainingCount":
+            new_remaining,
+
+        "lastTakenAt":
+            now_utc.isoformat(),
+
+        "updatedAt":
+            now_utc.isoformat(),
+    }
+
+    if next_allowed_at:
+        update_data[
+            "nextAllowedAt"
+        ] = (
+            next_allowed_at
+            .isoformat()
+        )
+
+    else:
+        update_data[
+            "nextAllowedAt"
+        ] = None
+
+    ref.update(
+        update_data
+    )
+
+    # =================================
+    # 복용 로그
+    # =================================
+
+    # 로그 화면의 날짜/시간은
+    # 한국 시간으로 저장
+    kst = timezone(
+        timedelta(
+            hours=9
+        )
+    )
+
+    now_kst = (
+        now_utc
+        .astimezone(kst)
+    )
+
+    log_ref = (
+        db.collection(
+            "logs"
+        )
+        .document()
+    )
+
+    log_data = {
+        "userId":
+            data.userId,
+
+        "stockId":
+            data.stockId,
+
+        "medicineName":
+            stock.get(
+                "medicineName",
+                "",
+            ),
+
+        "date":
+            now_kst.strftime(
+                "%Y-%m-%d"
+            ),
+
+        "time":
+            now_kst.strftime(
+                "%H:%M"
+            ),
+
+        "taken":
+            True,
+
+        "isStock":
+            True,
+
+        "asNeeded":
+            True,
+
+        "takenAt":
+            now_utc.isoformat(),
+
+        "minIntervalHours":
+            min_interval_hours,
+
+        "nextAllowedAt":
+            (
+                next_allowed_at
+                .isoformat()
+                if next_allowed_at
+                else None
+            ),
+    }
+
+    log_ref.set(
+        log_data
+    )
 
     return {
-        "success": True,
-        "remainingCount": remaining,
+        "success":
+            True,
+
+        "message":
+            "상비약 복용 완료",
+
+        "stockId":
+            data.stockId,
+
+        "remainingCount":
+            new_remaining,
+
+        "minIntervalHours":
+            min_interval_hours,
+
+        "lastTakenAt":
+            now_utc.isoformat(),
+
+        "nextAllowedAt":
+            (
+                next_allowed_at
+                .isoformat()
+                if next_allowed_at
+                else None
+            ),
     }
 
 

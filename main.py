@@ -9,15 +9,11 @@ from routers.user import router as user_router
 from routers.ocr import router as ocr_router
 from routers.stock import router as stock_router
 from routers.drugs import router as drugs_router
-from routers.safety import (
-    router as safety_router,
-)
-from routers.password_reset import (
-    router as password_reset_router,
-)
-from routers.guardians import (
-    router as guardians_router,
-)
+from routers.safety import router as safety_router
+from routers.password_reset import router as password_reset_router
+from routers.guardians import router as guardians_router
+from routers.interactions import router as interactions_router
+
 
 
 
@@ -44,6 +40,7 @@ app.include_router(drugs_router)
 app.include_router(safety_router)
 app.include_router(password_reset_router)
 app.include_router(guardians_router)
+app.include_router(interactions_router)
 
 @app.get("/")
 def root():

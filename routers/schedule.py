@@ -1,5 +1,6 @@
-from fastapi import APIRouter
+from fastapi import (APIRouter, HTTPException,)
 from datetime import datetime
+
 
 from firebase_config import db
 from models.schemas import ScheduleCreateRequest
@@ -84,3 +85,4 @@ def get_user_schedules(user_id: str):
         "count": len(schedules),
         "schedules": schedules
     }
+

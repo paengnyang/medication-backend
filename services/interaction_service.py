@@ -56,6 +56,12 @@ DUR_AGE_ENDPOINT = (
 DUR_PREGNANCY_ENDPOINT = (
     "getPwnmTabooInfoList03"
 )
+DUR_DOSAGE_ENDPOINT = (
+    "getCpctyAtentInfoList03"
+)
+DUR_EFFICACY_ENDPOINT = (
+    "getEfcyDplctInfoList03"
+)
 # 기존 식약처 API 키를 그대로 사용할 수 있게
 # 여러 이름을 fallback으로 확인한다.
 DUR_API_KEY = (
@@ -1184,6 +1190,561 @@ def _check_pregnancy_dur(
                 "임부금기 정보가 "
                 "확인되지 않았습니다."
             ),
+    }
+
+def _check_dosage_dur(
+    medicine_name,
+    ingredients,
+):
+    """
+    식약처 DUR 용량주의 데이터에서
+    현재 약이 용량주의 대상인지 확인한다.
+
+    현재 단계에서는 실제 복용량 초과 여부가 아니라
+    'DUR 용량주의 대상 품목인지'를 판정한다.
+    """
+
+    dataset = (
+        _load_dur_dataset(
+            DUR_DOSAGE_ENDPOINT
+        )
+    )
+
+    if not dataset.get(
+        "success"
+    ):
+        return {
+            "success": False,
+            "matchedRuleCount": 0,
+            "warnings": [],
+            "error":
+                dataset.get(
+                    "error"
+                ),
+        }
+
+    matched_items = []
+
+    for item in dataset.get(
+        "items",
+        [],
+    ):
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if _dur_item_matches_drug(
+            item,
+            medicine_name,
+            ingredients,
+        ):
+            matched_items.append(
+                item
+            )
+
+    warnings = []
+
+    for item in matched_items:
+
+        ingredient = (
+            _safe_string(
+                item.get(
+                    "INGR_NAME"
+                )
+            )
+            or
+            _safe_string(
+                item.get(
+                    "INGR_KOR_NAME"
+                )
+            )
+            or
+            _safe_string(
+                item.get(
+                    "MAIN_INGR"
+                )
+            )
+        )
+
+        prohibition = (
+            _safe_string(
+                item.get(
+                    "PROHBT_CONTENT"
+                )
+            )
+        )
+
+        remark = (
+            _safe_string(
+                item.get(
+                    "REMARK"
+                )
+            )
+        )
+
+        warnings.append(
+            {
+                "type":
+                    "dur_dosage_caution",
+
+                # 아직 실제 투여량과 비교한 것은 아니므로
+                # danger가 아니라 warning
+                "severity":
+                    "warning",
+
+                "medicineName":
+                    medicine_name,
+
+                "itemName":
+                    _safe_string(
+                        item.get(
+                            "ITEM_NAME"
+                        )
+                    ),
+
+                "ingredient":
+                    ingredient,
+
+                "ruleType":
+                    (
+                        _safe_string(
+                            item.get(
+                                "TYPE_NAME"
+                            )
+                        )
+                        or "용량주의"
+                    ),
+
+                "caution":
+                    prohibition,
+
+                "remark":
+                    remark,
+
+                "notificationDate":
+                    _safe_string(
+                        item.get(
+                            "NOTIFICATION_DATE"
+                        )
+                    ),
+
+                "message":
+                    (
+                        f"{medicine_name}은 "
+                        "식약처 DUR 용량주의 "
+                        "대상 의약품입니다."
+                    ),
+            }
+        )
+
+    return {
+        "success": True,
+
+        "matchedRuleCount":
+            len(
+                matched_items
+            ),
+
+        "warnings":
+            warnings,
+
+        "error": None,
+    }
+
+def _get_efficacy_groups(
+    medicine_name,
+    ingredients,
+    dataset_items,
+):
+    """
+    DUR 효능군중복 데이터에서
+    해당 약의 효능군(SERS_NAME)을 찾는다.
+    """
+
+    groups = []
+
+    for item in dataset_items:
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        if not _dur_item_matches_drug(
+            item,
+            medicine_name,
+            ingredients,
+        ):
+            continue
+
+        sers_name = (
+            _safe_string(
+                item.get(
+                    "SERS_NAME"
+                )
+            )
+        )
+
+        effect_name = (
+            _safe_string(
+                item.get(
+                    "EFFECT_NAME"
+                )
+            )
+        )
+
+        if not sers_name:
+            continue
+
+        groups.append(
+            {
+                "sersName":
+                    sers_name,
+
+                "effectName":
+                    effect_name,
+
+                "ingredient":
+                    (
+                        _safe_string(
+                            item.get(
+                                "INGR_NAME"
+                            )
+                        )
+                        or
+                        _safe_string(
+                            item.get(
+                                "INGR_KOR_NAME"
+                            )
+                        )
+                    ),
+
+                "prohibition":
+                    _safe_string(
+                        item.get(
+                            "PROHBT_CONTENT"
+                        )
+                    ),
+
+                "remark":
+                    _safe_string(
+                        item.get(
+                            "REMARK"
+                        )
+                    ),
+            }
+        )
+
+    # 동일 효능군 중복 제거
+    result = []
+
+    seen = set()
+
+    for group in groups:
+
+        key = (
+            group.get(
+                "sersName"
+            )
+        )
+
+        if not key:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        result.append(
+            group
+        )
+
+    return result
+
+def _check_efficacy_duplication(
+    candidate_name,
+    candidate_item_seq,
+    candidate_ingredients,
+    checked_medications,
+):
+    """
+    새 약과 현재 복용약들의
+    DUR 효능군(SERS_NAME)을 비교한다.
+    """
+
+    dataset = (
+        _load_dur_dataset(
+            DUR_EFFICACY_ENDPOINT
+        )
+    )
+
+    if not dataset.get(
+        "success"
+    ):
+        return {
+            "success": False,
+            "candidateGroups": [],
+            "checkedMedicationCount": 0,
+            "warnings": [],
+            "error":
+                dataset.get(
+                    "error"
+                ),
+        }
+
+    dataset_items = (
+        dataset.get(
+            "items",
+            [],
+        )
+    )
+
+    # ========================================
+    # 새 약 효능군
+    # ========================================
+
+    candidate_groups = (
+        _get_efficacy_groups(
+            candidate_name,
+            candidate_ingredients,
+            dataset_items,
+        )
+    )
+
+    candidate_group_map = {
+        group["sersName"]:
+            group
+        for group in candidate_groups
+        if group.get(
+            "sersName"
+        )
+    }
+
+    warnings = []
+
+    checked_count = 0
+
+    # ========================================
+    # 기존 복용약과 비교
+    # ========================================
+
+    for medication in (
+        checked_medications
+    ):
+
+        current_name = (
+            _safe_string(
+                medication.get(
+                    "medicineName"
+                )
+            )
+        )
+
+        current_item_seq = (
+            _safe_string(
+                medication.get(
+                    "itemSeq"
+                )
+            )
+        )
+
+        current_ingredients = (
+            medication.get(
+                "ingredients",
+                [],
+            )
+        )
+
+        if not isinstance(
+            current_ingredients,
+            list,
+        ):
+            current_ingredients = []
+
+        # 같은 품목 자체는 효능군중복으로
+        # 다시 경고하지 않는다.
+        # 이미 동일성분 중복 검사에서 잡는다.
+        if (
+            candidate_item_seq
+            and current_item_seq
+            and candidate_item_seq
+            == current_item_seq
+        ):
+            continue
+
+        current_groups = (
+            _get_efficacy_groups(
+                current_name,
+                current_ingredients,
+                dataset_items,
+            )
+        )
+
+        if not current_groups:
+            continue
+
+        checked_count += 1
+
+        current_group_map = {
+            group["sersName"]:
+                group
+            for group in current_groups
+            if group.get(
+                "sersName"
+            )
+        }
+
+        common_groups = (
+            set(
+                candidate_group_map.keys()
+            )
+            &
+            set(
+                current_group_map.keys()
+            )
+        )
+
+        for group_name in (
+            common_groups
+        ):
+
+            candidate_group = (
+                candidate_group_map[
+                    group_name
+                ]
+            )
+
+            current_group = (
+                current_group_map[
+                    group_name
+                ]
+            )
+
+            warnings.append(
+                {
+                    "type":
+                        "dur_efficacy_duplication",
+
+                    "severity":
+                        "warning",
+
+                    "medicineName":
+                        current_name,
+
+                    "candidateMedicineName":
+                        candidate_name,
+
+                    "sersName":
+                        group_name,
+
+                    "effectName":
+                        (
+                            candidate_group.get(
+                                "effectName"
+                            )
+                            or
+                            current_group.get(
+                                "effectName"
+                            )
+                            or ""
+                        ),
+
+                    "candidateIngredient":
+                        candidate_group.get(
+                            "ingredient",
+                            "",
+                        ),
+
+                    "currentIngredient":
+                        current_group.get(
+                            "ingredient",
+                            "",
+                        ),
+
+                    "prohibition":
+                        (
+                            candidate_group.get(
+                                "prohibition"
+                            )
+                            or
+                            current_group.get(
+                                "prohibition"
+                            )
+                            or ""
+                        ),
+
+                    "remark":
+                        (
+                            candidate_group.get(
+                                "remark"
+                            )
+                            or
+                            current_group.get(
+                                "remark"
+                            )
+                            or ""
+                        ),
+
+                    "message":
+                        (
+                            f"{candidate_name}과 "
+                            f"{current_name}이 "
+                            f"동일 효능군 "
+                            f"'{group_name}'에 "
+                            "해당합니다."
+                        ),
+                }
+            )
+
+    # ========================================
+    # 경고 중복 제거
+    # ========================================
+
+    unique_warnings = []
+
+    seen = set()
+
+    for warning in warnings:
+
+        key = (
+            warning.get(
+                "medicineName"
+            ),
+            warning.get(
+                "sersName"
+            ),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        unique_warnings.append(
+            warning
+        )
+
+    return {
+        "success": True,
+
+        "candidateGroups":
+            candidate_groups,
+
+        "checkedMedicationCount":
+            checked_count,
+
+        "warnings":
+            unique_warnings,
+
+        "error": None,
     }
 
 def _age_rule_applies(
@@ -2362,6 +2923,20 @@ def check_drug_interactions(
         )
     )
 
+    dosage_result = (
+        _check_dosage_dur(
+            candidate_name,
+            candidate_ingredients,
+        )
+    )
+
+    dosage_warnings = (
+        dosage_result.get(
+            "warnings",
+            [],
+        )
+    )
+
     candidate_precautions = (
         candidate.get(
             "precautions"
@@ -2780,6 +3355,26 @@ def check_drug_interactions(
                         }
                     )
 
+    # ========================================
+    # DUR 효능군중복주의
+    # ========================================
+
+    efficacy_result = (
+        _check_efficacy_duplication(
+            candidate_name,
+            candidate_item_seq,
+            candidate_ingredients,
+            checked_medications,
+        )
+    )
+
+    efficacy_warnings = (
+        efficacy_result.get(
+            "warnings",
+            [],
+        )
+    )
+
     # --------------------------------
     # 동일 경고 중복 제거
     # --------------------------------
@@ -2838,7 +3433,9 @@ def check_drug_interactions(
         len(unique_warnings) > 0 or
         len(unique_dur_warnings) > 0 or
         len(age_warnings) > 0 or
-        len(pregnancy_warnings) > 0
+        len(pregnancy_warnings) > 0 or
+        len(dosage_warnings) > 0 or
+        len(efficacy_warnings) > 0
     )
 
 
@@ -2972,6 +3569,69 @@ def check_drug_interactions(
         "pregnancyWarnings":
             pregnancy_warnings,
 
+        # =====================================
+        # 용량주의
+        # =====================================
+
+        "dosageCheck": {
+            "success":
+                dosage_result.get(
+                    "success",
+                    False,
+                ),
+
+            "matchedRuleCount":
+                dosage_result.get(
+                    "matchedRuleCount",
+                    0,
+                ),
+
+            "error":
+                dosage_result.get(
+                    "error"
+                ),
+        },
+
+        "dosageWarnings":
+            dosage_warnings,
+
+        # =====================================
+        # 효능군중복주의
+        # =====================================
+
+        "efficacyDuplicationCheck": {
+            "success":
+                efficacy_result.get(
+                    "success",
+                    False,
+                ),
+
+            "candidateGroups":
+                efficacy_result.get(
+                    "candidateGroups",
+                    [],
+                ),
+
+            "checkedMedicationCount":
+                efficacy_result.get(
+                    "checkedMedicationCount",
+                    0,
+                ),
+
+            "warningCount":
+                len(
+                    efficacy_warnings
+                ),
+
+            "error":
+                efficacy_result.get(
+                    "error"
+                ),
+        },
+
+        "efficacyWarnings":
+            efficacy_warnings,
+
         # '안전'이라고 판정하지 않는다.
         "screeningStatus":
             (
@@ -2981,7 +3641,13 @@ def check_drug_interactions(
                 else "age_contraindication"
                 if age_warnings
 
-                else "dur_warning_found"
+                else "dosage_caution"
+                if dosage_warnings
+
+                else "efficacy_duplication"
+                if efficacy_warnings
+
+                else "dur_interaction_warning"
                 if unique_dur_warnings
 
                 else "warning_found"
@@ -3006,14 +3672,33 @@ def check_drug_interactions(
                 if age_warnings
 
                 else
+                "해당 의약품에 식약처 DUR"
+                "용량주의 정보가 있습니다."
+                if dosage_warnings
+
+                else
                 "식약처 DUR 병용금기가 "
                 "확인되었습니다."
                 if unique_dur_warnings
 
                 else
+                "동일 성분이 포함된 의약품이 "
+                "현재 복용약에 있습니다."
+                if any(
+                    warning.get("type")
+                    == "duplicate_ingredient"
+                    for warning in unique_warnings
+                )
+                
+                else
                 "사용상주의사항 기반 "
                 "병용 경고가 확인되었습니다."
                 if unique_warnings
+
+                else
+                "동일 효능군의 의약품을 "
+                "중복 복용할 가능성이 있습니다."
+                if efficacy_warnings
 
                 else
                 "DUR 검사 중 일부 약의 "

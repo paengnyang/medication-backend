@@ -13,6 +13,10 @@ from routers.safety import router as safety_router
 from routers.password_reset import router as password_reset_router
 from routers.guardians import router as guardians_router
 from routers.interactions import router as interactions_router
+from routers import dose_info
+from routers import package_info
+from routers import allergy
+from routers import symptom_recommendation
 
 
 
@@ -41,6 +45,10 @@ app.include_router(safety_router)
 app.include_router(password_reset_router)
 app.include_router(guardians_router)
 app.include_router(interactions_router)
+app.include_router(dose_info.router)
+app.include_router(package_info.router)
+app.include_router(allergy.router)
+app.include_router(symptom_recommendation.router)
 
 @app.get("/")
 def root():

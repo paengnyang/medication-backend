@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from datetime import datetime
 
 from firebase_config import db
@@ -103,12 +103,88 @@ def get_user_logs(user_id: str):
     logs = []
 
     for doc in docs:
-        log = doc.to_dict()
-        log["logId"] = doc.id
-        logs.append(log)
+        log_data = doc.to_dict() or {}
+        log_data["logId"] = doc.id
+        logs.append(log_data)
 
     return {
         "success": True,
         "count": len(logs),
         "logs": logs
+    }
+
+# =================================
+# 이 상비약의 복용 기록도 같이 삭제
+# =================================
+
+
+deleted_log_count = 0
+
+
+@router.delete(
+    "/stock/{user_id}/{log_id}"
+)
+def delete_stock_log(
+    user_id: str,
+    log_id: str,
+):
+    ref = (
+        db.collection("logs")
+        .document(log_id)
+    )
+
+    doc = ref.get()
+
+    if not doc.exists:
+        raise HTTPException(
+            status_code=404,
+            detail="복용 기록을 찾을 수 없습니다.",
+        )
+
+    log = (
+        doc.to_dict()
+        or {}
+    )
+
+    # 사용자 확인
+    if (
+        str(
+            log.get(
+                "userId",
+                "",
+            )
+        )
+        != user_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="접근 권한이 없습니다.",
+        )
+
+    # 상비약 기록만 삭제 허용
+    if log.get("isStock") is not True:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "상비약 복용 기록만 "
+                "삭제할 수 있습니다."
+            ),
+        )
+
+    medicine_name = str(
+        log.get(
+            "medicineName",
+            "",
+        )
+    )
+
+    ref.delete()
+
+    return {
+        "success": True,
+        "message":
+            "상비약 복용 기록이 삭제되었습니다.",
+    
+        "deletedLogCount":
+            deleted_log_count,
     }

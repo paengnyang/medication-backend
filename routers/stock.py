@@ -15,6 +15,111 @@ router = APIRouter(
     tags=["Stocks"]
 )
 
+@router.delete(
+    "/{user_id}/{stock_id}"
+)
+def delete_stock(
+    user_id: str,
+    stock_id: str,
+):
+    # =================================
+    # 상비약 확인
+    # =================================
+
+    ref = (
+        db.collection(
+            "stockMedicines"
+        )
+        .document(
+            stock_id
+        )
+    )
+
+    doc = ref.get()
+
+    if not doc.exists:
+        raise HTTPException(
+            status_code=404,
+            detail=
+                "상비약을 찾을 수 없습니다.",
+        )
+
+    stock = (
+        doc.to_dict()
+        or {}
+    )
+
+    # =================================
+    # 사용자 확인
+    # =================================
+
+    if (
+        stock.get("userId")
+        != user_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=
+                "접근 권한이 없습니다.",
+        )
+
+    # =================================
+    # 해당 상비약의 복용 로그 삭제
+    # =================================
+
+    log_docs = (
+        db.collection("logs")
+        .where(
+            "userId",
+            "==",
+            user_id,
+        )
+        .where(
+            "stockId",
+            "==",
+            stock_id,
+        )
+        .stream()
+    )
+
+    deleted_log_count = 0
+
+    for log_doc in log_docs:
+        log_data = (
+            log_doc.to_dict()
+            or {}
+        )
+
+        # 일반 복약 기록은 보호
+        if (
+            log_data.get("isStock")
+            is not True
+        ):
+            continue
+
+        log_doc.reference.delete()
+
+        deleted_log_count += 1
+
+    # =================================
+    # 상비약 자체 삭제
+    # =================================
+
+    ref.delete()
+
+    return {
+        "success": True,
+
+        "message":
+            "상비약과 관련 복용 기록이 "
+            "삭제되었습니다.",
+
+        "stockId":
+            stock_id,
+
+        "deletedLogCount":
+            deleted_log_count,
+    }
 
 # 상비약 추가
 @router.post("/add")
@@ -329,6 +434,8 @@ def consume_stock(
     )
 
     log_data = {
+        "logId":
+            log_ref.id,
         "userId":
             data.userId,
 

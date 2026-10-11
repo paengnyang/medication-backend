@@ -13,7 +13,7 @@ from fastapi import (
 )
 
 from fastapi.responses import Response
-
+from services.drug_detail_format_service import enrich_drug_detail
 
 router = APIRouter(
     prefix="/drugs",
@@ -208,6 +208,7 @@ def get_drug_detail(
                 item_seq
             )
         )
+        
 
         if drug is None:
             return {
@@ -223,6 +224,11 @@ def get_drug_detail(
                 "message":
                     "해당 의약품의 상세정보를 찾지 못했습니다.",
             }
+        drug = (
+            enrich_drug_detail(
+                drug
+            )
+)
 
         return {
             "success":

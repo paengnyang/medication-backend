@@ -212,10 +212,33 @@ def _normalize_medicine(medicine):
         "setSize": set_size,
         "startDate": start_date,
         "endDate": end_date,
-        # 약 DB/API에서 추출한 최소 복용 간격
-        "minIntervalHours": _to_int(medicine.get("minIntervalHours"),
-            0,
-        ),
+        # 약 DB/API에서 추출한 공식 복용량 정보
+        "singleDoseText":
+            str(
+                medicine.get(
+                    "singleDoseText",
+                    "",
+                )
+                or ""
+            ).strip(),
+
+        "maxDailyDoseText":
+            str(
+                medicine.get(
+                    "maxDailyDoseText",
+                    "",
+                )
+                or ""
+            ).strip(),
+
+        "usage":
+            str(
+                medicine.get(
+                    "usage",
+                    "",
+                )
+                or ""
+            ).strip(),
     }
 
     # OCR 약 이름 보정 정보 유지
@@ -587,12 +610,30 @@ async def ocr_prescription_and_save(
             # =================================
             # A. 상비약 / 필요 시 복용
             # =================================
-            min_interval_hours = _to_int(
+            single_dose_text = str(
                 medicine.get(
-                "minIntervalHours"
-            ),
-            0,
+                    "singleDoseText",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            max_daily_dose_text = str(
+    medicine.get(
+        "maxDailyDoseText",
+        "",
     )
+    or ""
+).strip()
+
+            usage_text = str(
+                medicine.get(
+                    "usage",
+                    "",
+                )
+                or ""
+            ).strip()
+     
 
             item_seq = str(
                 medicine.get(
@@ -665,10 +706,20 @@ async def ocr_prescription_and_save(
                         .isoformat(),
                 }
 
-                if min_interval_hours > 0:
+                if single_dose_text:
+                        update_data[
+                        "singleDoseText"
+                    ] = single_dose_text
+
+                if max_daily_dose_text:
                     update_data[
-                    "minIntervalHours"
-                ] = min_interval_hours
+                        "maxDailyDoseText"
+                    ] = max_daily_dose_text
+
+                if usage_text:
+                    update_data[
+                        "usage"
+                    ] = usage_text
 
                 if item_seq:
                     update_data[
@@ -702,14 +753,14 @@ async def ocr_prescription_and_save(
                      "itemSeq":
                         item_seq,
 
-                    "minIntervalHours":
-                        min_interval_hours,
-                    # 아직 복용 전
-                    "lastTakenAt":
-                        None,
+                    "singleDoseText":
+                        single_dose_text,
 
-                    "nextAllowedAt":
-                        None,
+                    "maxDailyDoseText":
+                        max_daily_dose_text,
+
+                    "usage":
+                        usage_text,
 
                     "createdAt":
                         datetime.now()
@@ -749,6 +800,18 @@ async def ocr_prescription_and_save(
                     "asNeeded":
                         True,
 
+                    "itemSeq":
+                        item_seq,
+
+                    "singleDoseText":
+                        single_dose_text,
+
+                    "maxDailyDoseText":
+                        max_daily_dose_text,
+
+                    "usage":
+                        usage_text,
+
                     "createdAt":
                         datetime.now()
                         .isoformat(),
@@ -758,8 +821,8 @@ async def ocr_prescription_and_save(
                 allergy_warning = (
                     check_allergy_warning(
                         user_id=userId,
-                        medicine_name=
-                            medicine_name,
+                        medicine_name=medicine_name,
+                        item_seq=item_seq,
                     )
             )
 
@@ -839,6 +902,7 @@ async def ocr_prescription_and_save(
                 check_allergy_warning(
                     user_id=userId,
                     medicine_name=medicine_name,
+                    item_seq=item_seq,
                 )
             )
 

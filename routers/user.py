@@ -1,20 +1,31 @@
-from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from fastapi import APIRouter, HTTPException, Header
+from datetime import datetime, timezone
 import uuid
+import hashlib
+import hmac
 
 from firebase_config import db
+from services.login_session_service import (
+    create_login_session, get_session_user_id, revoke_login_session
+)
 from models.schemas import (
     UserCreateRequest,
     UserLoginRequest,
     MedicationTimesUpdateRequest,
+    AllergyListUpdateRequest,
 )
-
+from google.cloud import firestore
 from services.password_service import (
     hash_password,
     verify_user_password,
 )
 from services.guardian_service import (
     get_linked_guardian_phone,
+)
+from services.email_verification_service import (
+    consume_email_verification,
+    get_email_verification_ref,
+    get_verification_token_hash,
 )
 
 
@@ -28,18 +39,20 @@ router = APIRouter(
 # 사용자 생성
 # ============================================================
 
+
 @router.post("/create")
-def create_user(
-    data: UserCreateRequest
-):
+def create_user(data: UserCreateRequest):
+
+    email = data.email.strip().lower()
+    token = data.verificationToken.strip()
+
+    # ========================================
+    # 1. 이메일 중복 확인
+    # ========================================
 
     existing_users = list(
         db.collection("users")
-        .where(
-            "email",
-            "==",
-            data.email
-        )
+        .where("email", "==", email)
         .limit(1)
         .stream()
     )
@@ -47,90 +60,199 @@ def create_user(
     if existing_users:
         raise HTTPException(
             status_code=409,
-            detail="이미 가입된 이메일입니다."
+            detail="이미 가입된 이메일입니다.",
         )
 
-    user_id = str(
-        uuid.uuid4()
-    )
+    # ========================================
+    # 2. 회원가입 데이터 준비
+    # ========================================
 
-    # ✅ 비밀번호 암호화
-    password_hash = (
-        hash_password(
-            data.password
-        )
+    user_id = str(uuid.uuid4())
+
+    password_hash = hash_password(
+        data.password
     )
 
     user_data = {
-        "userId":
-            user_id,
-
-        "name":
-            data.name,
-
-        "email":
-            data.email,
-
-        "phone":
-            data.phone,
-
-        "passwordHash":
-            password_hash,
-
-        "gender":
-            data.gender,
-
-        "pregnancy":
-            data.pregnancy,
-
-        "birthYear":
-            data.birthYear,
-
-        "birthMonth":
-            data.birthMonth,
-
-        "birthDay":
-            data.birthDay,
-
-        "guardianPhone":
-            data.guardianPhone,
-
-        "allergyList":
-            data.allergyList,
-
-        "createdAt":
-            datetime.now().isoformat()
+        "userId": user_id,
+        "name": data.name,
+        "email": email,
+        "phone": data.phone,
+        "passwordHash": password_hash,
+        "gender": data.gender,
+        "pregnancy": data.pregnancy,
+        "birthYear": data.birthYear,
+        "birthMonth": data.birthMonth,
+        "birthDay": data.birthDay,
+        "guardianPhone": data.guardianPhone,
+        "allergyList": data.allergyList,
+        "emailVerified": True,
+        "createdAt": datetime.now().isoformat(),
     }
 
-    db.collection(
-        "users"
-    ).document(
-        user_id
-    ).set(
-        user_data
+    # ========================================
+    # 3. 인증 문서 및 사용자 문서
+    # ========================================
+
+    verification_ref = (
+        get_email_verification_ref(email)
     )
 
-    response_user = (
-        user_data.copy()
+    user_ref = (
+        db.collection("users")
+        .document(user_id)
     )
 
-    response_user.pop(
-        "passwordHash",
-        None
+    # 이메일 중복 가입 방지용 문서
+    email_key = hashlib.sha256(
+        email.encode("utf-8")
+    ).hexdigest()
+
+    email_index_ref = (
+        db.collection("registered_emails")
+        .document(email_key)
     )
+
+    token_hash = get_verification_token_hash(
+        token
+    )
+
+    # ========================================
+    # 4. 트랜잭션 처리
+    # ========================================
+
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def register_user(transaction):
+
+        # Firestore 트랜잭션:
+        # 모든 읽기를 먼저 수행
+        verification_doc = verification_ref.get(
+            transaction=transaction
+        )
+
+        email_index_doc = email_index_ref.get(
+            transaction=transaction
+        )
+
+        if email_index_doc.exists:
+            raise HTTPException(
+                status_code=409,
+                detail="이미 가입된 이메일입니다.",
+            )
+
+        if not verification_doc.exists:
+            raise HTTPException(
+                status_code=400,
+                detail="이메일 인증 정보가 없습니다.",
+            )
+
+        verification = (
+            verification_doc.to_dict() or {}
+        )
+
+        verified_until = verification.get(
+            "verifiedUntil"
+        )
+
+        if verified_until is None:
+            raise HTTPException(
+                status_code=400,
+                detail="이메일 인증이 완료되지 않았습니다.",
+            )
+
+        # Firestore timestamp와 비교
+        if verified_until.tzinfo is None:
+            verified_until = verified_until.replace(
+                tzinfo=timezone.utc
+            )
+
+        now = datetime.now(timezone.utc)
+
+        stored_hash = (
+            verification.get(
+                "verificationTokenHash"
+            ) or ""
+        )
+
+        valid = (
+            verification.get("email") == email
+            and verification.get("verified") is True
+            and verification.get("used") is not True
+            and now < verified_until
+            and hmac.compare_digest(
+                stored_hash,
+                token_hash,
+            )
+        )
+
+        if not valid:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "이메일 인증이 만료되었거나 "
+                    "유효하지 않습니다."
+                ),
+            )
+
+        # ====================================
+        # 5. 계정 생성 + 토큰 사용 완료
+        # ====================================
+
+        transaction.create(
+            user_ref,
+            user_data
+        )
+
+        transaction.create(
+            email_index_ref,
+            {
+                "email": email,
+                "userId": user_id,
+                "createdAt": now,
+            },
+        )
+
+        transaction.update(
+            verification_ref,
+            {
+                "used": True,
+                "verificationTokenHash": None,
+                "usedAt": now,
+            },
+        )
+
+    try:
+        register_user(transaction)
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print(
+            "[USER CREATE ERROR]",
+            type(e).__name__,
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="회원가입 처리 중 오류가 발생했습니다.",
+        )
+
+    # ========================================
+    # 6. 회원가입 성공 응답
+    # ========================================
+
+    response_user = user_data.copy()
+    response_user.pop("passwordHash", None)
 
     return {
-        "success":
-            True,
-
-        "message":
-            "사용자 정보 저장 완료",
-
-        "userId":
-            user_id,
-
-        "user":
-            response_user
+        "success": True,
+        "message": "이메일 인증 및 회원가입 완료",
+        "userId": user_id,
+        "user": response_user,
     }
 
 
@@ -183,7 +305,10 @@ def login_user(
         None
     )
 
+    session_token = create_login_session(user_data["userId"])
+
     return {
+        "sessionToken": session_token,
         "success":
             True,
 
@@ -196,6 +321,33 @@ def login_user(
         "user":
             user_data
     }
+
+
+# ============================================================
+# 저장된 로그인 세션 확인 / 해제
+# 주의: /{user_id}보다 먼저 등록한다.
+# ============================================================
+
+@router.get("/session/me")
+def get_current_session_user(authorization: str | None = Header(default=None)):
+    user_id = get_session_user_id(authorization)
+    doc = db.collection("users").document(user_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=401, detail="탈퇴하거나 삭제된 계정입니다.")
+    user = doc.to_dict() or {}
+    user.pop("passwordHash", None)
+    user["userId"] = user_id
+    linked_phone = get_linked_guardian_phone(user_id)
+    if linked_phone:
+        user["guardianPhone"] = linked_phone
+    return {"success": True, "user": user}
+
+
+@router.post("/session/logout")
+def logout_session(authorization: str | None = Header(default=None)):
+    get_session_user_id(authorization)
+    revoke_login_session(authorization)
+    return {"success": True, "message": "로그아웃 완료"}
 
 
 # ============================================================
@@ -253,6 +405,88 @@ def get_user(
         "user":
             user_data
     }
+
+# ============================================================
+# 사용자 알레르기 목록 수정
+# ============================================================
+
+@router.patch(
+    "/{user_id}/allergies"
+)
+async def update_allergies(
+    user_id: str,
+    request:
+        AllergyListUpdateRequest,
+):
+    try:
+        user_ref = (
+            db.collection("users")
+            .document(user_id)
+        )
+
+        user_doc = (
+            user_ref.get()
+        )
+
+        if not user_doc.exists:
+            return {
+                "success": False,
+                "message":
+                    "사용자를 찾을 수 없습니다.",
+            }
+
+        # --------------------------------
+        # 공백 제거 + 빈 문자열 제거
+        # --------------------------------
+
+        cleaned = []
+
+        for allergy in (
+            request.allergyList
+        ):
+            value = (
+                str(allergy)
+                .strip()
+            )
+
+            if not value:
+                continue
+
+            if value not in cleaned:
+                cleaned.append(
+                    value
+                )
+
+        user_ref.update({
+            "allergyList":
+                cleaned,
+        })
+
+        return {
+            "success": True,
+            "userId":
+                user_id,
+            "allergyList":
+                cleaned,
+            "message":
+                "알레르기 정보가 저장되었습니다.",
+        }
+
+    except Exception as e:
+        print(
+            "알레르기 목록 저장 오류:",
+            str(e),
+        )
+
+        return {
+            "success": False,
+            "message":
+                "알레르기 정보 저장 중 "
+                "오류가 발생했습니다.",
+            "error":
+                str(e),
+        }
+    
 @router.patch("/{user_id}/medication-times")
 def update_medication_times(
     user_id: str,

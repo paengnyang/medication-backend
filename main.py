@@ -17,7 +17,11 @@ from routers import dose_info
 from routers import package_info
 from routers import allergy
 from routers import symptom_recommendation
-
+from routers import ingredients
+from dotenv import load_dotenv
+from routers.email_verification import router as email_verification_router
+from routers.notifications import router as notifications_router
+load_dotenv()
 
 
 
@@ -49,6 +53,9 @@ app.include_router(dose_info.router)
 app.include_router(package_info.router)
 app.include_router(allergy.router)
 app.include_router(symptom_recommendation.router)
+app.include_router(ingredients.router)
+app.include_router(email_verification_router)
+app.include_router(notifications_router)
 
 @app.get("/")
 def root():

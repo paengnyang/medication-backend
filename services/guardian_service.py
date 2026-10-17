@@ -427,65 +427,28 @@ def connect_guardian(
 # 복약 사용자의 보호자 목록
 # ============================================================
 
-def get_guardians_for_ward(
-    ward_user_id: str
-):
-
+ 
+def get_guardians_for_ward(ward_user_id: str):
+    ward_user_id = str(ward_user_id).strip()
     docs = (
-        db.collection(
-            "guardian_links"
-        )
-        .where(
-            "wardUserId",
-            "==",
-            ward_user_id,
-        )
+        db.collection("guardian_links")
+        .where("wardUserId", "==", ward_user_id)
         .stream()
     )
-
     result = []
-
     for doc in docs:
-
-        data = (
-            doc.to_dict()
-            or {}
-        )
-
-        if data.get(
-            "status"
-        ) != "active":
+        data = doc.to_dict() or {}
+        if data.get("status") != "active":
             continue
-
-        guardian_user_id = (
-            data.get(
-                "guardianUserId"
-            )
-        )
-
-        guardian = _get_user(
-            guardian_user_id
-        )
-
+        guardian_user_id = data.get("guardianUserId")
+        guardian = _get_user(guardian_user_id)
         result.append({
-            "linkId":
-                doc.id,
-
-            "guardianUserId":
-                guardian_user_id,
-
-            "guardianName":
-                (
-                    guardian.get("name")
-                    if guardian
-                    else None
-                ),
+            "linkId": doc.id,
+            "guardianUserId": guardian_user_id,
+            "guardianName": guardian.get("name") if guardian else None,
             "guardianPhone": guardian.get("phone") if guardian else None,
-
-            "status":
-                "active",
+            "status": "active",
         })
-
     return result
 
 
@@ -493,65 +456,28 @@ def get_guardians_for_ward(
 # 보호자가 관리하는 사용자 목록
 # ============================================================
 
-def get_wards_for_guardian(
-    guardian_user_id: str
-):
-
+def get_wards_for_guardian(guardian_user_id: str):
+    guardian_user_id = str(guardian_user_id).strip()
     docs = (
-        db.collection(
-            "guardian_links"
-        )
-        .where(
-            "guardianUserId",
-            "==",
-            guardian_user_id,
-        )
+        db.collection("guardian_links")
+        .where("guardianUserId", "==", guardian_user_id)
         .stream()
     )
-
     result = []
-
     for doc in docs:
-
-        data = (
-            doc.to_dict()
-            or {}
-        )
-
-        if data.get(
-            "status"
-        ) != "active":
+        data = doc.to_dict() or {}
+        if data.get("status") != "active":
             continue
-
-        ward_user_id = (
-            data.get(
-                "wardUserId"
-            )
-        )
-
-        ward = _get_user(
-            ward_user_id
-        )
-
+        ward_user_id = data.get("wardUserId")
+        ward = _get_user(ward_user_id)
         result.append({
-            "linkId":
-                doc.id,
-
-            "wardUserId":
-                ward_user_id,
-
-            "wardName":
-                (
-                    ward.get("name")
-                    if ward
-                    else None
-                ),
-
-            "status":
-                "active",
+            "linkId": doc.id,
+            "wardUserId": ward_user_id,
+            "wardName": ward.get("name") if ward else None,
+            "status": "active",
         })
-
     return result
+
 
 # ============================================================
 # 보호자-사용자 연결 확인
@@ -592,6 +518,85 @@ def _check_active_guardian_link(
             }
 
     return None
+
+
+# ============================================================
+# 보호자 연결 해제
+# ============================================================
+
+def disconnect_guardian(
+    ward_user_id: str,
+    guardian_user_id: str,
+):
+
+    ward_user_id = str(
+        ward_user_id
+    ).strip()
+
+    guardian_user_id = str(
+        guardian_user_id
+    ).strip()
+
+    if not ward_user_id or not guardian_user_id:
+        raise ValueError(
+            "사용자 ID가 올바르지 않습니다."
+        )
+
+    # ========================================
+    # 실제 연결 정보 조회
+    # ========================================
+
+    docs = (
+        db.collection(
+            "guardian_links"
+        )
+        .where(
+            "wardUserId",
+            "==",
+            ward_user_id,
+        )
+        .stream()
+    )
+
+    target_links = []
+
+    for doc in docs:
+
+        data = doc.to_dict() or {}
+
+        if (
+            str(data.get("guardianUserId", "")).strip()
+            != guardian_user_id
+        ):
+            continue
+
+        if data.get("status") != "active":
+            continue
+
+        target_links.append(doc)
+   
+    if not target_links:
+        raise ValueError(
+            "연결된 보호자를 찾을 수 없습니다."
+        )
+
+    # ========================================
+    # 연결 상태 변경
+    # ========================================
+
+    for doc in target_links:
+
+        doc.reference.update({
+            "status": "disconnected",
+            "disconnectedAt": _now(),
+        })
+
+    return {
+        "wardUserId": ward_user_id,
+        "guardianUserId": guardian_user_id,
+        "disconnectedCount": len(target_links),
+        "status": "disconnected",
+    }
 
 
 # ============================================================
@@ -1257,10 +1262,11 @@ def get_ward_medication_history_by_date(
     # 2. 보호자-사용자 연결 확인
     # --------------------------------
 
-    _check_active_guardian_link(
+    if _check_active_guardian_link(
         guardian_user_id,
         ward_user_id,
-    )
+    ) is None:
+        raise ValueError("해당 사용자의 복약 기록을 조회할 권한이 없습니다.")
 
     # --------------------------------
     # 3. 사용자 정보 조회

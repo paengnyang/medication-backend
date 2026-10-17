@@ -1,9 +1,14 @@
 import html
 import json
+import hashlib
 import os
 import re
 from datetime import date
-from urllib.parse import quote
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from urllib.parse import (
     quote,
     urlencode,
@@ -66,7 +71,7 @@ DUR_EFFICACY_ENDPOINT = (
 # 여러 이름을 fallback으로 확인한다.
 DUR_API_KEY = (
     os.getenv("MFDS_DUR_API_KEY")
-    or os.getenv("MFDS_API_KEY")
+    or os.getenv("MFDS_SERVICE_KEY")
     or os.getenv("MFDS_SERVICE_KEY")
     or os.getenv("DATA_GO_KR_SERVICE_KEY")
     or os.getenv("SERVICE_KEY")
@@ -160,7 +165,52 @@ def _clean_document_text(text):
 
     return text.strip()
 
+KST = timezone(
+    timedelta(hours=9)
+)
 
+
+def _is_current_schedule(
+    schedule: dict,
+) -> bool:
+    """
+    오늘 기준으로 아직 복용 기간이
+    끝나지 않은 schedule만 True.
+    """
+
+    # 명시적으로 비활성화된 일정 제외
+    if schedule.get("active") is False:
+        return False
+
+    end_date_raw = str(
+        schedule.get(
+            "endDate",
+            "",
+        )
+        or ""
+    ).strip()
+
+    # 과거 데이터처럼 endDate가 없으면
+    # 일단 검사 대상으로 유지
+    if not end_date_raw:
+        return True
+
+    try:
+        end_date = datetime.strptime(
+            end_date_raw,
+            "%Y-%m-%d",
+        ).date()
+
+        today = datetime.now(
+            KST
+        ).date()
+
+        return end_date >= today
+
+    except ValueError:
+        # 이상한 과거 데이터 때문에
+        # 안전검사를 건너뛰지는 않음
+        return True
 # ============================================================
 # 약 상세정보 조회
 # ============================================================
@@ -2291,94 +2341,182 @@ def _normalize_dur_warning(
             ),
     }
 
-def _check_dur_pair(
-    candidate_name,
-    current_name,
-):
+# 검사 결과를 24시간 동안 재사용
+DUR_CACHE_HOURS = 24
+
+
+def _dur_pair_key(drug_a, drug_b):
     """
-    candidate + current 조합을 DUR로 검사.
-
-    먼저:
-        candidate → current
-
-    없으면:
-        current → candidate
-
-    순서로 확인한다.
+    A+B와 B+A를 같은 약물 쌍으로 취급.
     """
+    names = sorted([
+        " ".join(drug_a.strip().casefold().split()),
+        " ".join(drug_b.strip().casefold().split()),
+    ])
 
-    first = (
-        _call_dur_interaction_api(
-            candidate_name,
-            current_name,
+    raw_key = json.dumps(
+        names,
+        ensure_ascii=False,
+    )
+
+    cache_id = hashlib.sha256(
+        raw_key.encode("utf-8")
+    ).hexdigest()
+
+    return names, cache_id
+
+
+def _get_dur_cache(user_id, cache_id):
+    doc = (
+        db.collection("users")
+        .document(str(user_id))
+        .collection("durPairCache")
+        .document(cache_id)
+        .get()
+    )
+
+    if not doc.exists:
+        return None
+
+    data = doc.to_dict() or {}
+
+    expires_at = data.get("expiresAt")
+
+    if expires_at is None:
+        return None
+
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(
+            tzinfo=timezone.utc
         )
+
+    if datetime.now(timezone.utc) >= expires_at:
+        return None
+
+    result = data.get("result")
+
+    if not isinstance(result, dict):
+        return None
+
+    if result.get("success") is not True:
+        return None
+
+    return result
+
+
+def _save_dur_cache(user_id, cache_id, names, result):
+    now = datetime.now(timezone.utc)
+
+    (
+        db.collection("users")
+        .document(str(user_id))
+        .collection("durPairCache")
+        .document(cache_id)
+        .set({
+            "drugNames": names,
+            "result": result,
+            "checkedAt": now,
+            "expiresAt": now + timedelta(
+                hours=DUR_CACHE_HOURS
+            ),
+        })
     )
 
-    # 첫 번째 호출에서 결과 발견
-    if (
-        first.get("success")
-        and first.get("items")
-    ):
-        return {
-            "success": True,
-            "direction":
-                "candidate_to_current",
-            "items":
-                first["items"],
-            "error": None,
-        }
 
-    # 첫 API 호출 자체가 실패했다면
-    # 반대방향을 호출해서 API 장애를
-    # 없는 결과처럼 위장하지 않는다.
-    first_error = (
-        first.get("error")
+
+def _check_dur_pair(user_id, candidate_name, current_name):
+    names, cache_id = _dur_pair_key(
+        candidate_name,
+        current_name,
     )
 
-    second = (
-        _call_dur_interaction_api(
-            current_name,
-            candidate_name,
-        )
-    )
+    drug_a, drug_b = names
 
-    if (
-        second.get("success")
-        and second.get("items")
-    ):
+    if not drug_a or not drug_b:
         return {
-            "success": True,
-            "direction":
-                "current_to_candidate",
-            "items":
-                second["items"],
-            "error": None,
-        }
-
-    # 둘 중 하나라도 정상 호출됐으면
-    # 병용금기 없음으로 판단 가능
-    if (
-        first.get("success")
-        or second.get("success")
-    ):
-        return {
-            "success": True,
+            "success": False,
             "direction": None,
             "items": [],
+            "error": "약 이름이 비어 있습니다.",
+        }
+
+    # 1. 사용자별 기존 검사 결과 조회
+    try:
+        cached = _get_dur_cache(user_id, cache_id)
+
+        if cached is not None:
+            print("[DUR] 캐시 사용:", drug_a, "+", drug_b)
+            return cached
+
+    except Exception as e:
+        print("[DUR] 캐시 조회 실패:", type(e).__name__)
+
+    # 2. 최초 검사 - 첫 번째 방향 조회
+    first = _call_dur_interaction_api(
+        drug_a,
+        drug_b,
+    )
+
+    if first.get("success") and first.get("items"):
+        result = {
+            "success": True,
+            "direction": "canonical_order",
+            "items": first["items"],
             "error": None,
         }
 
-    return {
-        "success": False,
-        "direction": None,
-        "items": [],
-        "error":
-            (
-                second.get("error")
-                or first_error
-                or "DUR 조회 실패"
-            ),
-    }
+    else:
+        # 첫 방향에 결과가 없거나 실패했다면
+        # 반대 방향도 확인
+        second = _call_dur_interaction_api(
+            drug_b,
+            drug_a,
+        )
+
+        if second.get("success") and second.get("items"):
+            result = {
+                "success": True,
+                "direction": "reverse_order",
+                "items": second["items"],
+                "error": None,
+            }
+
+        elif first.get("success") and second.get("success"):
+            result = {
+                "success": True,
+                "direction": None,
+                "items": [],
+                "error": None,
+            }
+
+        else:
+            result = {
+                "success": False,
+                "direction": None,
+                "items": [],
+                "error": (
+                    first.get("error")
+                    or second.get("error")
+                    or "DUR 병용금기 조회 미완료"
+                ),
+            }
+
+    # 3. 정상 확인된 결과만 저장
+    if result["success"]:
+        try:
+            _save_dur_cache(
+                user_id,
+                cache_id,
+                names,
+                result,
+            )
+            print("[DUR] 캐시 저장 완료:", drug_a, "+", drug_b)
+
+        except Exception as e:
+            print("[DUR] 캐시 저장 실패:", type(e).__name__)
+
+    return result
+
 # ============================================================
 # 성분 추출
 # ============================================================
@@ -2722,10 +2860,11 @@ def _get_current_medications(
             doc.to_dict()
             or {}
         )
-
-        # active 명시적으로 false면 제외
-        if data.get("active") is False:
+        if not _is_current_schedule(
+            data
+        ):
             continue
+
 
         medicines.append(
             {
@@ -2998,6 +3137,7 @@ def check_drug_interactions(
         in candidate_ingredients
         if _normalize_for_match(name)
     }
+    checked_dur_pairs = {}
 
     for medication in (
         current_medications
@@ -3117,17 +3257,43 @@ def check_drug_interactions(
             }
         )
 
-        # =================================
-        # DUR 공식 병용금기 검사
-        # =================================
+                # =================================
+                # DUR 공식 병용금기 검사
+                # =================================
 
-        dur_result = (
-            _check_dur_pair(
+        same_drug = (
+            bool(candidate_item_seq)
+            and bool(current_item_seq)
+            and str(candidate_item_seq) == str(current_item_seq)
+        )
+
+        if same_drug:
+            print("[DUR] 동일 품목 조회 생략:", current_name)
+
+            dur_result = {
+                "success": True,
+                "direction": "same_drug",
+                "items": [],
+                "error": None,
+            }
+
+        else:
+            pair_names, pair_id = _dur_pair_key(
                 candidate_name,
                 current_name,
             )
-        )
 
+            if pair_id in checked_dur_pairs:
+                dur_result = checked_dur_pairs[pair_id]
+
+            else:
+                dur_result = _check_dur_pair(
+                    user_id,
+                    candidate_name,
+                    current_name,
+                )
+
+                checked_dur_pairs[pair_id] = dur_result
         if dur_result.get(
             "success"
         ):

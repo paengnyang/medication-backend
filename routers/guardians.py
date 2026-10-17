@@ -8,6 +8,7 @@ from pydantic import (
 from services.guardian_service import (
     create_guardian_code,
     connect_guardian,
+    disconnect_guardian,
     get_guardians_for_ward,
     get_wards_for_guardian,
     get_ward_today_medication_status,
@@ -46,6 +47,18 @@ class GuardianConnectRequest(
         ...,
         min_length=6,
         max_length=6,
+    )
+class GuardianDisconnectRequest(
+    BaseModel
+):
+    wardUserId: str = Field(
+        ...,
+        min_length=1,
+    )
+
+    guardianUserId: str = Field(
+        ...,
+        min_length=1,
     )
 
 
@@ -127,6 +140,47 @@ def connect(
             "message":
                 str(e),
         }
+
+
+# ============================================================
+# 보호자 연결 해제
+# ============================================================
+
+@router.post("/disconnect")
+def disconnect(
+    request: GuardianDisconnectRequest
+):
+    try:
+
+        result = disconnect_guardian(
+            ward_user_id=request.wardUserId,
+            guardian_user_id=request.guardianUserId,
+        )
+
+        return {
+            "success": True,
+            "message": "보호자 연결이 해제되었습니다.",
+            **result,
+        }
+
+    except ValueError as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+
+    except Exception as e:
+
+        print(
+            "[GUARDIAN DISCONNECT ERROR]",
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="보호자 연결 해제 중 오류가 발생했습니다.",
+        )
 
 
 # ============================================================
@@ -284,3 +338,4 @@ def get_ward_medication_history(
             detail=
                 "날짜별 복약 기록 조회 중 오류가 발생했습니다.",
         )
+

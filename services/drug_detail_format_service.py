@@ -826,6 +826,72 @@ def _build_precaution_details(
 
     return result
 
+
+# ============================================================
+# 포장 규격 / 복용량 표시 보조 함수
+# ============================================================
+
+def _package_details(raw):
+    """원문에서 포장 규격을 읽되 여러 규격 중 임의로 하나를 고르지 않는다."""
+    package_unit = _safe_text(
+        raw.get("PACK_UNIT")
+        or raw.get("PACK_UNIT_NAME")
+        or raw.get("PACKAGE_UNIT")
+    )
+    if not package_unit:
+        return "", [], None, ""
+
+    options = [x.strip() for x in re.split(r"[,;\n]+", package_unit) if x.strip()]
+    if not options:
+        options = [package_unit]
+
+    package_count = None
+    package_count_unit = ""
+    if len(options) == 1:
+        counts = re.findall(r"(?<!\d)(\d+)\s*(정|캡슐|캅셀)(?![가-힣])", options[0])
+        if len(counts) == 1:
+            package_count = int(counts[0][0])
+            package_count_unit = "캡슐" if counts[0][1] == "캅셀" else counts[0][1]
+
+    return package_unit, options, package_count, package_count_unit
+
+
+def _dose_details(drug):
+    """품목 제형에 해당하는 허가사항만 읽고 1회량·명시된 최대량을 표시한다.
+
+    환자별 복용량은 라벨을 유지한다. '1일 3회'를 하루 최대량으로
+    해석하거나 곱셈으로 최대량을 만들지 않는다.
+    """
+    raw = drug.get("raw") if isinstance(drug.get("raw"), dict) else {}
+    usage = _safe_text(drug.get("usage") or raw.get("UD_DOC_DATA"))
+    if not usage:
+        return "", ""
+
+    articles = _extract_articles(usage)
+    selected = _select_usage_article(drug, articles) if articles else None
+    paragraphs = (
+        selected.get("paragraphs", []) if selected
+        else [_clean_document_text(usage)]
+    )
+
+    one_time = []
+    explicit_daily_max = []
+    for paragraph in paragraphs:
+        text = _clean_document_text(paragraph)
+        if not text:
+            continue
+
+        # 1회량은 조건(성인/소아 등)을 그대로 함께 제시한다.
+        if re.search(r"1\s*회\s*(?:에|당)?\s*(?:[0-9]+(?:\s*/\s*[0-9]+)?|반)", text):
+            one_time.append(text)
+
+        # '1일 3회'는 복용 빈도이므로 최대량으로 표시하지 않는다.
+        if re.search(r"(?:1\s*일|하루)\s*(?:에\s*)?최대|최대\s*(?:1\s*일|하루)", text):
+            explicit_daily_max.append(text)
+
+    return " / ".join(dict.fromkeys(one_time)), " / ".join(dict.fromkeys(explicit_daily_max))
+
+
 # ============================================================
 # 최종 상세정보 보강
 # ============================================================
@@ -933,5 +999,20 @@ def enrich_drug_detail(
                 warning_document
             )
         )
+
+    # 식약처 원본에 존재하는 정보만 추가한다.
+    package_unit, package_options, package_count, package_count_unit = _package_details(raw)
+    dose_per_intake, max_daily_dose = _dose_details(result)
+    result["packageUnit"] = package_unit
+    result["packageOptions"] = package_options
+    result["packageCount"] = package_count
+    result["packageCountUnit"] = package_count_unit
+    result["dosePerIntake"] = dose_per_intake
+    result["maxDailyDose"] = max_daily_dose
+    result["doseSource"] = (
+        "식품의약품안전처 의약품 허가사항"
+        if package_unit or dose_per_intake or max_daily_dose
+        else ""
+    )
 
     return result

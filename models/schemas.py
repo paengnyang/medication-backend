@@ -38,7 +38,8 @@ class UserCreateRequest(BaseModel):
     guardianPhone: str = ""
     
     allergyList: list[str] = Field(default_factory=list)
-
+    verificationToken: str = Field(..., min_length=1)
+    
 class UserLoginRequest(BaseModel):
     email: str
     password: str
@@ -63,3 +64,12 @@ class MedicationTimesUpdateRequest(BaseModel):
     morning: str
     lunch: str
     dinner: str
+
+from pydantic import BaseModel
+from typing import List
+
+
+class AllergyListUpdateRequest(
+    BaseModel
+):
+    allergyList: List[str]

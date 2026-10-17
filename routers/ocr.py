@@ -645,206 +645,194 @@ async def ocr_prescription_and_save(
                 if set_size <= 0:
                     continue
 
-    # =================================
-    # 상비약은 schedules가 아니라
-    # stockMedicines에 저장
-    # =================================
+                # =================================
+                # 상비약은 stockMedicines에 저장
+                # =================================
 
-            docs = list(
-                db.collection(
-                    "stockMedicines"
-                )
-                .where(
-                    "userId",
-                    "==",
-                    userId
-                )
-                .where(
-                    "medicineName",
-                    "==",
-                    medicine_name
-                )
-                .stream()
-            )
-
-    # ---------------------------------
-    # 이미 등록된 상비약인 경우
-    # 기존 재고에 추가
-    # ---------------------------------
-
-            if docs:
-                stock_doc = docs[0]
-
-                current_stock = (
-                    stock_doc.to_dict()
-                )
-
-                current_remaining = (
-                    _to_int(
-                        current_stock.get(
-                            "remainingCount"
-                    ),
-                    0
-                )
-            )
-
-                new_remaining = (
-                    current_remaining
-                    + set_size
-                )
-
-
-                update_data = {
-                    "remainingCount":
-                        new_remaining,
-
-                    "setSize":
-                        set_size,
-
-                    "updatedAt":
-                        datetime.now()
-                        .isoformat(),
-                }
-
-                if single_dose_text:
-                        update_data[
-                        "singleDoseText"
-                    ] = single_dose_text
-
-                if max_daily_dose_text:
-                    update_data[
-                        "maxDailyDoseText"
-                    ] = max_daily_dose_text
-
-                if usage_text:
-                    update_data[
-                        "usage"
-                    ] = usage_text
-
-                if item_seq:
-                    update_data[
-                    "itemSeq"
-                ] = item_seq
-                stock_doc.reference.update(
-                    update_data
-            )
-
-                stock_data = {
-                    "stockId":
-                        stock_doc.id,
-
-                    "userId":
-                        userId,
-
-                    "medicineName":
-                        medicine_name,
-
-                    "remainingCount":
-                        new_remaining,
-
-                    "setSize":
-                        set_size,
-
-                    "isStock":
-                        True,
-
-                    "asNeeded":
-                        True,
-                     "itemSeq":
-                        item_seq,
-
-                    "singleDoseText":
-                        single_dose_text,
-
-                    "maxDailyDoseText":
-                        max_daily_dose_text,
-
-                    "usage":
-                        usage_text,
-
-                    "createdAt":
-                        datetime.now()
-                        .isoformat(),
-                }
-
-    # ---------------------------------
-    # 처음 등록하는 상비약
-    # ---------------------------------
-
-            else:
-                stock_ref = (
+                docs = list(
                     db.collection(
                         "stockMedicines"
-                    ).document()
-            )
-
-                stock_data = {
-                    "stockId":
-                        stock_ref.id,
-
-                    "userId":
-                        userId,
-
-                    "medicineName":
-                        medicine_name,
-
-                    "remainingCount":
-                        set_size,
-
-                    "setSize":
-                        set_size,
-
-                    "isStock":
-                        True,
-
-                    "asNeeded":
-                        True,
-
-                    "itemSeq":
-                        item_seq,
-
-                    "singleDoseText":
-                        single_dose_text,
-
-                    "maxDailyDoseText":
-                        max_daily_dose_text,
-
-                    "usage":
-                        usage_text,
-
-                    "createdAt":
-                        datetime.now()
-                        .isoformat(),
-            }
-
-        # 알레르기 확인
-                allergy_warning = (
-                    check_allergy_warning(
-                        user_id=userId,
-                        medicine_name=medicine_name,
-                        item_seq=item_seq,
                     )
-            )
-
-                if allergy_warning:
-                    stock_data[
-                        "allergyWarning"
-                    ] = allergy_warning
-
-                stock_ref.set(
-                    stock_data
+                    .where(
+                        "userId",
+                        "==",
+                        userId,
+                    )
+                    .where(
+                        "medicineName",
+                        "==",
+                        medicine_name,
+                    )
+                    .stream()
                 )
 
-    # 저장 성공 개수 계산을 위해
-    # 기존 응답 배열에도 넣어줌
-            saved_schedules.append(
-                stock_data
-            )
+                # -----------------------------
+                # 이미 등록된 상비약
+                # -----------------------------
+                if docs:
+                    stock_doc = docs[0]
 
-    # 매우 중요:
-    # 아래 일반 복약 schedule 생성으로
-    # 내려가지 않음
-            continue
+                    current_stock = (
+                        stock_doc.to_dict()
+                        or {}
+                    )
+
+                    current_remaining = _to_int(
+                        current_stock.get(
+                            "remainingCount"
+                        ),
+                        0,
+                    )
+
+                    new_remaining = (
+                        current_remaining
+                        + set_size
+                    )
+
+                    update_data = {
+                        "remainingCount":
+                            new_remaining,
+
+                        "setSize":
+                            set_size,
+
+                        "updatedAt":
+                            datetime.now()
+                            .isoformat(),
+                    }
+
+                    if single_dose_text:
+                        update_data[
+                            "singleDoseText"
+                        ] = single_dose_text
+
+                    if max_daily_dose_text:
+                        update_data[
+                            "maxDailyDoseText"
+                        ] = max_daily_dose_text
+
+                    if usage_text:
+                        update_data[
+                            "usage"
+                        ] = usage_text
+
+                    if item_seq:
+                        update_data[
+                            "itemSeq"
+                        ] = item_seq
+
+                    stock_doc.reference.update(
+                        update_data
+                    )
+
+                    stock_data = {
+                        "stockId":
+                            stock_doc.id,
+
+                        "userId":
+                            userId,
+
+                        "medicineName":
+                            medicine_name,
+
+                        "remainingCount":
+                            new_remaining,
+
+                        "setSize":
+                            set_size,
+
+                        "isStock":
+                            True,
+
+                        "asNeeded":
+                            True,
+
+                        "itemSeq":
+                            item_seq,
+
+                        "singleDoseText":
+                            single_dose_text,
+
+                        "maxDailyDoseText":
+                            max_daily_dose_text,
+
+                        "usage":
+                            usage_text,
+                    }
+
+                # -----------------------------
+                # 처음 등록하는 상비약
+                # -----------------------------
+                else:
+                    stock_ref = (
+                        db.collection(
+                            "stockMedicines"
+                        )
+                        .document()
+                    )
+
+                    stock_data = {
+                        "stockId":
+                            stock_ref.id,
+
+                        "userId":
+                            userId,
+
+                        "medicineName":
+                            medicine_name,
+
+                        "remainingCount":
+                            set_size,
+
+                        "setSize":
+                            set_size,
+
+                        "isStock":
+                            True,
+
+                        "asNeeded":
+                            True,
+
+                        "itemSeq":
+                            item_seq,
+
+                        "singleDoseText":
+                            single_dose_text,
+
+                        "maxDailyDoseText":
+                            max_daily_dose_text,
+
+                        "usage":
+                            usage_text,
+
+                        "createdAt":
+                            datetime.now()
+                            .isoformat(),
+                    }
+
+                    allergy_warning = (
+                        check_allergy_warning(
+                            user_id=userId,
+                            medicine_name=
+                                medicine_name,
+                            item_seq=item_seq,
+                        )
+                    )
+
+                    if allergy_warning:
+                        stock_data[
+                            "allergyWarning"
+                        ] = allergy_warning
+
+                    stock_ref.set(
+                        stock_data
+                    )
+
+                saved_schedules.append(
+                    stock_data
+                )
+                continue
+
             # =================================
             # B. 일반 정기 복약약
             # =================================
@@ -888,7 +876,7 @@ async def ocr_prescription_and_save(
                 timing = "정보 없음"
 
             times = _generate_user_times(
-                user_id,
+                userId,
                 daily_count,
             )
 

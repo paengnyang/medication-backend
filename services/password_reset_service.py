@@ -1,6 +1,9 @@
 import os
 import secrets
 import hashlib
+import smtplib
+from email.message import EmailMessage
+from dotenv import load_dotenv
 
 from datetime import (
     datetime,
@@ -14,6 +17,7 @@ from firebase_config import db
 
 from services.password_service import (
     hash_password,
+    verify_user_password,
 )
 
 
@@ -21,6 +25,7 @@ RESET_CODE_EXPIRE_MINUTES = 10
 RESET_TOKEN_EXPIRE_MINUTES = 10
 MAX_VERIFY_ATTEMPTS = 5
 
+load_dotenv()
 
 def _now():
     return datetime.now(
@@ -61,6 +66,41 @@ def _find_user_by_email(
     return None
 
 
+def _send_password_reset_email(
+    email: str,
+    code: str,
+):
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+
+    if not smtp_user or not smtp_password:
+        raise RuntimeError(
+            "SMTP 이메일 설정이 없습니다."
+        )
+
+    message = EmailMessage()
+    message["From"] = smtp_user
+    message["To"] = email
+    message["Subject"] = "[MediCare] 비밀번호 재설정 인증번호"
+
+    message.set_content(
+        f"비밀번호 재설정 인증번호: {code}\n"
+        "인증번호는 10분간 유효합니다.\n\n"
+        "본인이 요청하지 않았다면 무시해주세요."
+    )
+
+    with smtplib.SMTP_SSL(
+        os.getenv("SMTP_HOST", "smtp.gmail.com"),
+        int(os.getenv("SMTP_PORT", "465")),
+        timeout=10,
+    ) as smtp:
+        smtp.login(
+            smtp_user,
+            smtp_password,
+        )
+        smtp.send_message(message)
+
+
 def request_password_reset(
     email: str
 ):
@@ -96,6 +136,11 @@ def request_password_reset(
         ).document()
     )
 
+    # 실제 Gmail로 인증번호 전송
+    _send_password_reset_email(
+        email=email,
+        code=code,
+    )
     doc_ref.set({
         "userId":
             user["userId"],
@@ -411,6 +456,18 @@ def confirm_password_reset(
     if not user_doc.exists:
         raise ValueError(
             "사용자 정보를 찾을 수 없습니다."
+        )
+
+        # 기존 비밀번호와 동일한지 검사
+    user_data = user_doc.to_dict() or {}
+
+    if verify_user_password(
+        user_data,
+        new_password,
+    ):
+        raise ValueError(
+            "기존 비밀번호와 동일합니다. "
+            "다른 비밀번호를 입력해주세요."
         )
 
     user_ref.update({

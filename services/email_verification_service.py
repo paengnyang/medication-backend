@@ -108,7 +108,34 @@ def build_verification_email_html(
     code: str,
     expire_minutes: int = 5,
     logo_cid: str | None = None,
+    purpose: str = "signup",
 ):
+    is_reset = purpose == "password_reset"
+
+    mail_title = (
+        "비밀번호 재설정 안내"
+        if is_reset else "이메일 인증 안내"
+    )
+
+    mail_category = (
+        "비밀번호 재설정"
+        if is_reset else "이메일 계정 인증"
+    )
+
+    mail_description = (
+        "비밀번호 재설정을 위한 인증번호입니다.<br>"
+        "아래 인증번호를 입력해 주세요."
+        if is_reset
+        else
+        "이메일 계정 인증을 위한 인증번호입니다.<br>"
+        "아래 인증번호를 입력하여 인증을 완료해 주세요."
+    )
+
+    mail_notice = (
+        "MediCare 비밀번호 재설정을 위한"
+        if is_reset
+        else "MediCare 이메일 인증을 위한"
+    )
     if logo_cid:
         logo_html = f"""
         <img
@@ -353,6 +380,7 @@ def send_verification_email(
     to_email: str,
     code: str,
     expire_minutes: int = CODE_MINUTES,
+    purpose: str = "signup",
 ):
     if not SMTP_USER or not SMTP_PASSWORD:
         raise RuntimeError(
@@ -362,15 +390,22 @@ def send_verification_email(
     message = EmailMessage()
 
     message["Subject"] = (
-        "[MediCare] 이메일 인증 안내"
+        "[MediCare] 비밀번호 재설정 인증번호"
+        if purpose == "password_reset"
+        else "[MediCare] 이메일 인증 안내"
     )
 
     message["From"] = SMTP_USER
     message["To"] = to_email
 
-    # HTML을 지원하지 않는 메일 앱용 텍스트
+    email_type = (
+        "비밀번호 재설정"
+        if purpose == "password_reset"
+        else "이메일 인증"
+    )
+
     message.set_content(
-        f"이메일 인증번호: {code}\n"
+        f"{email_type} 인증번호: {code}\n"
         f"유효기간: {expire_minutes}분\n\n"
         "본인이 요청하지 않았다면 "
         "이 메일을 무시해주세요."
@@ -403,6 +438,7 @@ def send_verification_email(
         code=code,
         expire_minutes=expire_minutes,
         logo_cid=logo_cid,
+        purpose=purpose,
     )
 
     message.add_alternative(

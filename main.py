@@ -21,7 +21,14 @@ from routers import ingredients
 from dotenv import load_dotenv
 from routers.email_verification import router as email_verification_router
 from routers.notifications import router as notifications_router
+from routers import account_management
+from routers import prescription_groups
+from routers import medicine_favorites
+from routers import medicine_recent
+from routers.medicine_reuse import router as medicine_reuse_router
+
 load_dotenv()
+
 
 
 
@@ -56,6 +63,11 @@ app.include_router(symptom_recommendation.router)
 app.include_router(ingredients.router)
 app.include_router(email_verification_router)
 app.include_router(notifications_router)
+app.include_router(account_management.router)
+app.include_router(prescription_groups.router)
+app.include_router(medicine_favorites.router)
+app.include_router(medicine_recent.router)
+app.include_router(medicine_reuse_router)
 
 @app.get("/")
 def root():

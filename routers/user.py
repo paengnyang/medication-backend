@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import uuid
 import hashlib
 import hmac
+from pydantic import BaseModel, Field
 
 from firebase_config import db
 from services.login_session_service import (
@@ -322,6 +323,46 @@ def login_user(
             user_data
     }
 
+
+class VerifyPasswordRequest(BaseModel):
+    password: str = Field(min_length=1)
+
+
+@router.post("/verify-password")
+def verify_password(
+    request: VerifyPasswordRequest,
+    authorization: str | None = Header(default=None),
+):
+    # 로그인한 사용자 확인
+    user_id = get_session_user_id(authorization)
+
+    user_doc = (
+        db.collection("users")
+        .document(user_id)
+        .get()
+    )
+
+    if not user_doc.exists:
+        raise HTTPException(
+            status_code=404,
+            detail="사용자를 찾을 수 없습니다.",
+        )
+
+    user_data = user_doc.to_dict() or {}
+
+    if not verify_user_password(
+        user_data,
+        request.password,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="비밀번호가 올바르지 않습니다.",
+        )
+
+    return {
+        "success": True,
+        "message": "본인 확인 완료",
+    }
 
 # ============================================================
 # 저장된 로그인 세션 확인 / 해제

@@ -1089,6 +1089,12 @@ def get_ward_today_medication_status(
 
             "doses":
                 dose_status,
+            "prescriptionGroupId": schedule.get(
+                "prescriptionGroupId", ""
+            ),
+            "prescriptionCategory": schedule.get(
+                    "prescriptionCategory", ""
+            ),
         })
 
     remaining_doses = max(
@@ -1621,6 +1627,12 @@ def get_ward_medication_history_by_date(
 
             "doses":
                 doses,
+            "prescriptionGroupId": schedule.get(
+                "prescriptionGroupId", ""
+            ),
+            "prescriptionCategory": schedule.get(
+                "prescriptionCategory", ""
+            ),
         })
 
     # --------------------------------

@@ -19,6 +19,13 @@ from urllib.request import urlopen
 from dotenv import load_dotenv
 
 from firebase_config import db
+from services.medicine_detail_cache import (
+    fetch_medicine_detail_cached,
+)
+from services.medicine_detail_cache import (
+    fetch_medicine_detail_cached,
+    save_medicine_detail_cache,
+)
 
 load_dotenv()
 # ============================================================
@@ -214,55 +221,113 @@ def _is_current_schedule(
 # ============================================================
 # 약 상세정보 조회
 # ============================================================
+# 약 상세정보 캐시 (DUR 병용금기 캐시와 별개)
+_drug_detail_cache = {}
+
+# 약 상세정보를 메모리에 1시간 보관
+DRUG_DETAIL_CACHE_SECONDS = 3600
 
 def _get_drug_detail(item_seq):
-    """
-    이미 구현된
-    GET /drugs/{itemSeq}
-    를 백엔드 내부에서 재사용한다.
-    """
-
     item_seq = _safe_string(item_seq)
 
     if not item_seq:
         return None
 
+    now = datetime.now(timezone.utc)
+
+    # ========================================
+    # 1. 이미 조회한 상세정보가 있다면 재사용
+    # ========================================
+    cached = _drug_detail_cache.get(item_seq)
+
+    if cached is not None:
+        expires_at, drug = cached
+
+        if now < expires_at:
+            print(
+                "[INTERACTION] 상세정보 캐시 사용:",
+                item_seq,
+            )
+            return drug
+
+        _drug_detail_cache.pop(item_seq, None)
+
+    # ========================================
+    # 2. 내부 상세 API 호출
+    # ========================================
     url = (
         f"{BACKEND_INTERNAL_URL}"
         f"/drugs/{quote(item_seq)}"
     )
 
-    try:
-        with urlopen(
-            url,
-            timeout=15,
-        ) as response:
-
-            body = response.read().decode(
-                "utf-8"
+    # 식약처 API의 일시적인 응답 지연에 대응
+    for attempt in range(1, 3):
+        try:
+            print(
+                "[INTERACTION] 상세정보 조회:",
+                item_seq,
+                f"({attempt}/2)",
             )
 
-        result = json.loads(body)
+            with urlopen(
+                url,
+                timeout=35,
+            ) as response:
+                body = response.read().decode(
+                    "utf-8"
+                )
 
-        if result.get("success") is not True:
-            return None
+            result = json.loads(body)
 
-        drug = result.get("drug")
+            if result.get("success") is not True:
+                print(
+                    "[INTERACTION] 상세 API 응답 실패:",
+                    result.get("message"),
+                )
+                continue
 
-        if not isinstance(drug, dict):
-            return None
+            drug = result.get("drug")
 
-        return drug
+            if not isinstance(drug, dict):
+                print(
+                    "[INTERACTION] 상세정보 형식 오류:",
+                    item_seq,
+                )
+                continue
 
-    except Exception as e:
-        print(
-            "[INTERACTION]"
-            " 약 상세정보 조회 실패:",
-            item_seq,
-            str(e),
-        )
+            # ====================================
+            # 3. 성공한 데이터만 캐시 저장
+            # ====================================
+            _drug_detail_cache[item_seq] = (
+                datetime.now(timezone.utc)
+                + timedelta(
+                    seconds=DRUG_DETAIL_CACHE_SECONDS
+                ),
+                drug,
+            )
 
-        return None
+            print(
+                "[INTERACTION] 상세정보 조회 성공:",
+                item_seq,
+            )
+
+            return drug
+
+        except Exception as e:
+            print(
+                "[INTERACTION] 상세정보 조회 오류:",
+                item_seq,
+                f"({attempt}/2)",
+                type(e).__name__,
+                str(e),
+            )
+
+    print(
+        "[INTERACTION] 상세정보 조회 최종 실패:",
+        item_seq,
+    )
+
+    return None
 
 def _search_drug_detail_by_name(
     medicine_name
@@ -2445,63 +2510,34 @@ def _check_dur_pair(user_id, candidate_name, current_name):
         cached = _get_dur_cache(user_id, cache_id)
 
         if cached is not None:
-            print("[DUR] 캐시 사용:", drug_a, "+", drug_b)
+            print(
+                "[DUR] 캐시 사용:",
+                drug_a,
+                "+",
+                drug_b,
+            )
             return cached
 
     except Exception as e:
-        print("[DUR] 캐시 조회 실패:", type(e).__name__)
+        print(
+            "[DUR] 캐시 조회 실패:",
+            type(e).__name__,
+        )
 
-    # 2. 최초 검사 - 첫 번째 방향 조회
-    first = _call_dur_interaction_api(
+    # 2. 외부 DUR API 한 방향만 조회
+    api_result = _call_dur_interaction_api(
         drug_a,
         drug_b,
     )
 
-    if first.get("success") and first.get("items"):
-        result = {
-            "success": True,
-            "direction": "canonical_order",
-            "items": first["items"],
-            "error": None,
-        }
+    result = {
+        "success": api_result.get("success") is True,
+        "direction": "canonical_order",
+        "items": api_result.get("items", []),
+        "error": api_result.get("error"),
+    }
 
-    else:
-        # 첫 방향에 결과가 없거나 실패했다면
-        # 반대 방향도 확인
-        second = _call_dur_interaction_api(
-            drug_b,
-            drug_a,
-        )
-
-        if second.get("success") and second.get("items"):
-            result = {
-                "success": True,
-                "direction": "reverse_order",
-                "items": second["items"],
-                "error": None,
-            }
-
-        elif first.get("success") and second.get("success"):
-            result = {
-                "success": True,
-                "direction": None,
-                "items": [],
-                "error": None,
-            }
-
-        else:
-            result = {
-                "success": False,
-                "direction": None,
-                "items": [],
-                "error": (
-                    first.get("error")
-                    or second.get("error")
-                    or "DUR 병용금기 조회 미완료"
-                ),
-            }
-
-    # 3. 정상 확인된 결과만 저장
+    # 3. 성공한 결과만 캐시에 저장
     if result["success"]:
         try:
             _save_dur_cache(
@@ -2510,13 +2546,21 @@ def _check_dur_pair(user_id, candidate_name, current_name):
                 names,
                 result,
             )
-            print("[DUR] 캐시 저장 완료:", drug_a, "+", drug_b)
+
+            print(
+                "[DUR] 캐시 저장 완료:",
+                drug_a,
+                "+",
+                drug_b,
+            )
 
         except Exception as e:
-            print("[DUR] 캐시 저장 실패:", type(e).__name__)
+            print(
+                "[DUR] 캐시 저장 실패:",
+                type(e).__name__,
+            )
 
     return result
-
 # ============================================================
 # 성분 추출
 # ============================================================
@@ -3129,6 +3173,7 @@ def check_drug_interactions(
     checked_medications = []
 
     skipped_medications = []
+    ##checked_dur_pairs = set()
 
     # 후보약 성분 정규화
     candidate_ingredient_map = {
@@ -3165,11 +3210,11 @@ def check_drug_interactions(
 # =================================
 
         if current_item_seq:
-            current_detail = (
-                _get_drug_detail(
-                    current_item_seq
-                )
+            current_detail = fetch_medicine_detail_cached(
+                item_seq=current_item_seq,
+                fetcher=_get_drug_detail,
             )
+
 
 # =================================
 # 2. 기존 약에 itemSeq가 없으면
@@ -3199,9 +3244,14 @@ def check_drug_interactions(
                 )
 
                 if resolved_item_seq:
-                    current_item_seq = (
-                        resolved_item_seq
-                    )
+                    current_item_seq = resolved_item_seq
+
+                    # 이름 검색으로 찾은 상세정보도 캐싱
+                    if isinstance(current_detail, dict) and current_detail:
+                        save_medicine_detail_cache(
+                            item_seq=resolved_item_seq,
+                            detail=current_detail,
+                        )
 
         # --------------------------------
         # 기존 약 성분

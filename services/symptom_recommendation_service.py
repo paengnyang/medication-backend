@@ -6,10 +6,8 @@ import requests
 
 from urllib.parse import unquote
 
-from services.allergy_service import (
-    check_allergy,
-)
-
+from services.allergy_service import check_allergy
+from services.market_recommendation import rank_with_market_data
 
 # ============================================================
 # 식약처 e약은요 API
@@ -1160,6 +1158,28 @@ def recommend_by_symptom(
             )
         )
 
+        # 알레르기 검사가 실패하거나 완료되지 않은 경우 추천 제외
+        if (
+            not allergy_result.get("success")
+            or allergy_result.get("checked") is not True
+        ):
+            candidate["allergyCheck"] = {
+                "status": allergy_result.get(
+                    "screeningStatus", "check_failed"
+                ),
+                "hasWarning": False,
+                "checked": False,
+                "matchedAllergies": [],
+            }
+
+            candidate["excludeReason"] = (
+                "의약품 성분 또는 알레르기 검사 결과를 "
+                "확인할 수 없어 추천에서 제외했습니다."
+            )
+
+            excluded.append(candidate)
+            continue
+
         # 알레르기 검사가 실패했다면
         # 안전하게 추천 목록에서 제외
         if not allergy_result.get(
@@ -1237,7 +1257,14 @@ def recommend_by_symptom(
         recommendations.append(
             candidate
         )
-
+    # ========================================
+    # 식약처 생산·수입실적 기반 추천 순서 보정
+    # ========================================
+    recommendations = rank_with_market_data(
+        recommendations,
+        relevance_field="matchScore",
+        max_lookups=10,
+    )
     return {
         "success": True,
 

@@ -1,96 +1,56 @@
+
 import re
+import time
 from rapidfuzz import process, fuzz
 
-
-# ============================================================
-# 임시 의약품 DB
-#
-# 현재는 OCR 보정 동작 확인용.
-# 추후 식약처 의약품명 JSON/API 데이터로 교체 권장.
-# ============================================================
-
-MEDICINE_DATABASE = [
-    "베포스타비정",
-    "액티피드정",
-    "라베프라정",
-    "에르도스테인캡슐",
-    "메드닌정",
-    "크라모틴정",
-    "펠루비정",
-    "무코에스정",
-]
+from services.drug_api_service import search_drug_by_name
 
 
-# ============================================================
-# 이름 정규화
-# ============================================================
+# 식약처 검색 결과 메모리 캐시: 1시간
+SEARCH_CACHE_SECONDS = 3600
+_search_cache = {}
+
 
 def normalize_medicine_name(name: str) -> str:
-    """
-    OCR 결과와 실제 의약품명을 비교하기 전에 정리한다.
-
-    예:
-    *배포스타바정(배포타스틴) -> 배포스타바정
-    에르도스테인캡슬 -> 에르도스테인캡슐
-    """
     if not name:
         return ""
 
     name = str(name).strip()
-
-    # OCR에서 캡슐을 캡슬로 읽는 경우
     name = name.replace("캡슬", "캡슐")
 
-    # 괄호가 닫히지 않아도 괄호 뒤 성분명은 비교에서 제외
+    # 괄호 속 성분명 등은 이름 비교에서 제외
     name = re.split(r"[\(\[\{]", name, maxsplit=1)[0]
 
-    # 앞쪽 bullet 제거
-    name = re.sub(r"^[\*\-\·•]+", "", name)
+    # 앞쪽 기호 제거
+    name = re.sub(r"^[\*\-·•]+", "", name)
 
-    # 끝쪽 용량 표기 제거
-    # 예: 타이레놀정500mg -> 타이레놀정
+    # 단위 표기 통일
     name = re.sub(
-        r"\d+(?:\.\d+)?\s*(?:mg|MG|g|G|ml|mL|ML|밀리그램|그램|밀리리터)$",
-        "",
+        r"밀리그램",
+        "mg",
         name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(
+        r"밀리리터",
+        "ml",
+        name,
+        flags=re.IGNORECASE,
     )
 
-    # 공백 제거
-    name = re.sub(r"\s+", "", name)
-
-    # 한글 / 영문 / 숫자만 유지
-    name = re.sub(
-        r"[^가-힣A-Za-z0-9]",
-        "",
-        name,
-    )
+    # 공백과 일부 구분기호 제거
+    name = re.sub(r"[\s·\-_./]+", "", name)
 
     return name.lower()
 
 
-# ============================================================
-# 제형 추출
-# ============================================================
-
 def get_medicine_form(name: str):
-    """
-    동일 제형끼리 우선 비교한다.
-    """
     forms = [
-        "연질캡슐",
-        "캡슐",
-        "현탁액",
-        "점안액",
-        "흡입제",
-        "패취",
-        "패치",
-        "연고",
-        "크림",
-        "시럽",
-        "과립",
-        "겔",
-        "주사",
-        "정",
+        "연질캡슐", "캡슐", "현탁액",
+        "점안액", "흡입제", "패취",
+        "패치", "연고", "크림",
+        "시럽", "과립", "겔",
+        "주사", "정",
     ]
 
     normalized = normalize_medicine_name(name)
@@ -102,156 +62,214 @@ def get_medicine_form(name: str):
     return None
 
 
-# ============================================================
-# 후보 구성
-# ============================================================
+def _search_mfds(query: str):
+    """같은 검색어의 식약처 호출을 1시간 재사용"""
+    query = str(query or "").strip()
 
-def _build_candidates(ocr_name: str):
-    """
-    OCR 결과의 제형이 확인되면 동일 제형만 비교한다.
-    """
-    if not MEDICINE_DATABASE:
+    if not query:
         return []
 
-    form = get_medicine_form(ocr_name)
+    key = normalize_medicine_name(query)
+    cached = _search_cache.get(key)
 
-    if form is None:
-        return MEDICINE_DATABASE
+    if cached:
+        expires_at, medicines = cached
 
-    same_form = [
-        medicine
-        for medicine in MEDICINE_DATABASE
-        if get_medicine_form(medicine) == form
-    ]
+        if time.monotonic() < expires_at:
+            print("[DRUG MATCH] 검색 캐시 사용:", query)
+            return medicines
 
-    return same_form if same_form else MEDICINE_DATABASE
+        _search_cache.pop(key, None)
+
+    try:
+        medicines = search_drug_by_name(query)
+
+        if not isinstance(medicines, list):
+            medicines = []
+
+        _search_cache[key] = (
+            time.monotonic() + SEARCH_CACHE_SECONDS,
+            medicines,
+        )
+
+        return medicines
+
+    except Exception as e:
+        print(
+            "[DRUG MATCH] 식약처 검색 실패:",
+            query,
+            str(e),
+        )
+        # 호출 실패는 빈 결과로 캐시하지 않음
+        return []
 
 
-# ============================================================
-# 가장 비슷한 실제 의약품명 검색
-# ============================================================
+def _build_candidates(ocr_name: str):
+    """원본 검색 후 필요한 경우 제형 뒤 OCR 숫자 제거 검색"""
+    original = str(ocr_name or "").strip()
+
+    if not original:
+        return []
+
+    queries = [original]
+
+    # 예: 파모터정20079 -> 파모터정
+    # 단, 함량이 사라지므로 결과는 자동 확정하지 않음
+    fallback = re.sub(
+        r"(정|캡슐|시럽|연질캡슐)\d{2,}$",
+        r"\1",
+        re.sub(r"\s+", "", original),
+    )
+
+    if (
+        fallback != original
+        and fallback not in queries
+    ):
+        queries.append(fallback)
+
+    results = []
+    seen = set()
+
+    for query in queries[:2]:
+        medicines = _search_mfds(query)
+
+        for drug in medicines:
+            if not isinstance(drug, dict):
+                continue
+
+            item_name = str(
+                drug.get("itemName") or ""
+            ).strip()
+
+            item_seq = str(
+                drug.get("itemSeq") or ""
+            ).strip()
+
+            if not item_name or not item_seq:
+                continue
+
+            if item_seq in seen:
+                continue
+
+            seen.add(item_seq)
+            results.append(drug)
+
+    return results
+
 
 def match_medicine_name(ocr_name: str):
-    """
-    반환 형식:
-
-    {
-        "originalName": "배포스타바정",
-        "matchedName": "베포스타비정",
-        "suggestedName": "베포스타비정",
-        "score": 72.0,
-        "autoCorrected": False,
-        "needsReview": True,
-        "isValidMedicine": True
-    }
-
-    기준:
-    - 90점 이상: 자동 교정
-    - 65~89.9점: 실제 의약품 후보로 인정하되 사용자 확인
-    - 65점 미만: 약이 아닐 가능성이 높아 파서에서 제외
-    """
     original = str(ocr_name or "").strip()
-    normalized_ocr = normalize_medicine_name(original)
+    normalized = normalize_medicine_name(original)
 
-    if not normalized_ocr:
+    def result(
+        matched_name=None,
+        score=0.0,
+        auto=False,
+        valid=False,
+        item_seq=None,
+    ):
         return {
             "originalName": original,
-            "matchedName": original,
-            "suggestedName": None,
-            "score": 0.0,
-            "autoCorrected": False,
-            "needsReview": True,
-            "isValidMedicine": False,
+            "matchedName": matched_name or original,
+            "suggestedName": matched_name,
+            "score": round(float(score), 1),
+            "autoCorrected": auto,
+            "needsReview": not auto,
+            "isValidMedicine": valid,
+            # 자동 확정된 약에만 품목기준코드 부여
+            "itemSeq": item_seq if auto else None,
         }
+
+    # 복용 수량, 단순 제형 설명 등은 약 후보가 아님
+    if (
+        not normalized
+        or re.fullmatch(
+            r"\d+(?:\.\d+)?(?:정|캡슐|시럽)",
+            normalized,
+        )
+    ):
+        return result()
 
     candidates = _build_candidates(original)
 
     if not candidates:
-        return {
-            "originalName": original,
-            "matchedName": original,
-            "suggestedName": None,
-            "score": 0.0,
-            "autoCorrected": False,
-            "needsReview": True,
-            "isValidMedicine": False,
-        }
+        # OCR 후보는 파서에서 유지하고 사용자 검토
+        return result()
 
     normalized_map = {}
 
-    for medicine in candidates:
-        normalized = normalize_medicine_name(medicine)
+    for drug in candidates:
+        item_name = str(
+            drug.get("itemName") or ""
+        ).strip()
 
-        if normalized:
-            normalized_map[normalized] = medicine
+        key = normalize_medicine_name(item_name)
+
+        if key:
+            normalized_map.setdefault(
+                key, []
+            ).append(drug)
 
     if not normalized_map:
-        return {
-            "originalName": original,
-            "matchedName": original,
-            "suggestedName": None,
-            "score": 0.0,
-            "autoCorrected": False,
-            "needsReview": True,
-            "isValidMedicine": False,
-        }
+        return result()
 
-    # WRatio는 OCR 오탈자에 비교적 유연하다.
-    result = process.extractOne(
-        normalized_ocr,
-        normalized_map.keys(),
+    # 품목명까지 정확히 일치하는지 우선 확인
+    exact_matches = normalized_map.get(
+        normalized, []
+    )
+
+    if len(exact_matches) == 1:
+        drug = exact_matches[0]
+
+        print(
+            "[DRUG MATCH] 정확히 일치:",
+            original,
+            "->",
+            drug["itemName"],
+        )
+
+        return result(
+            matched_name=drug["itemName"],
+            score=100.0,
+            auto=True,
+            valid=True,
+            item_seq=str(drug["itemSeq"]),
+        )
+
+    # 이름은 같더라도 여러 품목코드가 있다면 직접 확인
+    if len(exact_matches) > 1:
+        return result(
+            matched_name=exact_matches[0]["itemName"],
+            score=100.0,
+            auto=False,
+            valid=True,
+        )
+
+    # 유사한 이름을 제안만 하고 자동 확정하지 않음
+    best = process.extractOne(
+        normalized,
+        list(normalized_map.keys()),
         scorer=fuzz.WRatio,
     )
 
-    if result is None:
-        return {
-            "originalName": original,
-            "matchedName": original,
-            "suggestedName": None,
-            "score": 0.0,
-            "autoCorrected": False,
-            "needsReview": True,
-            "isValidMedicine": False,
-        }
+    if best is None:
+        return result()
 
-    matched_normalized = result[0]
-    score = float(result[1])
-    matched_name = normalized_map[matched_normalized]
+    matched_key, score, _ = best
+    drug = normalized_map[matched_key][0]
 
-    # 짧은 OCR 문자열은 우연히 높은 점수가 나기 쉬우므로 자동교정 금지
-    too_short = len(normalized_ocr) < 4
+    print(
+        "[DRUG MATCH] 후보:",
+        original,
+        "->",
+        drug["itemName"],
+        "score=",
+        round(score, 1),
+    )
 
-    # 90점 이상만 자동교정
-    if score >= 90 and not too_short:
-        return {
-            "originalName": original,
-            "matchedName": matched_name,
-            "suggestedName": matched_name,
-            "score": round(score, 1),
-            "autoCorrected": True,
-            "needsReview": False,
-            "isValidMedicine": True,
-        }
-
-    # OCR 오탈자가 있는 실제 약 이름 후보
-    if score >= 65:
-        return {
-            "originalName": original,
-            "matchedName": matched_name,
-            "suggestedName": matched_name,
-            "score": round(score, 1),
-            "autoCorrected": False,
-            "needsReview": True,
-            "isValidMedicine": True,
-        }
-
-    # 유사도가 너무 낮으면 약으로 채택하지 않음
-    return {
-        "originalName": original,
-        "matchedName": matched_name,
-        "suggestedName": matched_name,
-        "score": round(score, 1),
-        "autoCorrected": False,
-        "needsReview": True,
-        "isValidMedicine": False,
-    }
+    return result(
+        matched_name=drug["itemName"],
+        score=score,
+        auto=False,
+        valid=(score >= 65),
+    )

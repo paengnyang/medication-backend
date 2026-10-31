@@ -19,6 +19,9 @@ from services.password_service import (
     hash_password,
     verify_user_password,
 )
+from services.email_verification_service import (
+    send_verification_email,
+)
 
 
 RESET_CODE_EXPIRE_MINUTES = 10
@@ -70,36 +73,12 @@ def _send_password_reset_email(
     email: str,
     code: str,
 ):
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_password = os.getenv("SMTP_PASSWORD")
-
-    if not smtp_user or not smtp_password:
-        raise RuntimeError(
-            "SMTP 이메일 설정이 없습니다."
-        )
-
-    message = EmailMessage()
-    message["From"] = smtp_user
-    message["To"] = email
-    message["Subject"] = "[MediCare] 비밀번호 재설정 인증번호"
-
-    message.set_content(
-        f"비밀번호 재설정 인증번호: {code}\n"
-        "인증번호는 10분간 유효합니다.\n\n"
-        "본인이 요청하지 않았다면 무시해주세요."
+    send_verification_email(
+        to_email=email,
+        code=code,
+        expire_minutes=RESET_CODE_EXPIRE_MINUTES,
+        purpose="password_reset",
     )
-
-    with smtplib.SMTP_SSL(
-        os.getenv("SMTP_HOST", "smtp.gmail.com"),
-        int(os.getenv("SMTP_PORT", "465")),
-        timeout=10,
-    ) as smtp:
-        smtp.login(
-            smtp_user,
-            smtp_password,
-        )
-        smtp.send_message(message)
-
 
 def request_password_reset(
     email: str

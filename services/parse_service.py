@@ -12,6 +12,8 @@ MEDICINE_FORM_PATTERN = (
     r"연질캡슐|"
     r"캡슐|"
     r"캡슬|"      # OCR에서 '캡슐'을 '캡슬'로 읽는 경우 대응
+    r"캡숄|"
+    r"캡술|"
     r"현탁액|"
     r"점안액|"
     r"흡입제|"
@@ -67,7 +69,25 @@ EXCLUDE_WORDS = {
     "계산",
 }
 
-
+# 약 이름이 아닌 OCR 후보
+NON_MEDICINE_NAMES = {
+    "정",
+    "1정",
+    "2정",
+    "3정",
+    "캡슐",
+    "1캡슐",
+    "2캡슐",
+    "필름코팅정",
+    "원형정",
+    "규정",
+    "코팅정",
+    "장방형정",
+    "흰색정",
+    "백색정",
+    "일반정",
+    "시럽",
+}
 # ============================================================
 # 기본 정리
 # ============================================================
@@ -341,6 +361,21 @@ def extract_medicine_name(line: str):
     matches = list(medicine_pattern.finditer(work))
 
     if not matches:
+        # 예: 엔시드8시간이알서
+        # OCR에서 서방정의 끝 글자가 누락된 경우
+        er_match = re.search(
+            r"[가-힣]{2,}\d+\s*시간\s*"
+            r"(?:이알서방정|이알서방|이알서|"
+            r"서방정|서방|이알)",
+            work,
+        )
+
+        if er_match:
+            return re.sub(
+                r"\s+",
+                "",
+                er_match.group(0),
+            )
         return None
 
     for match in matches:
@@ -350,6 +385,22 @@ def extract_medicine_name(line: str):
             continue
 
         if len(name) > 50:
+            continue
+        # 공백을 제거해서 일반 문구인지 확인
+        normalized_name = re.sub(
+            r"\s+",
+            "",
+            name,
+        )
+
+        if normalized_name in NON_MEDICINE_NAMES:
+            continue
+
+        # 숫자 + 정/캡슐처럼 수량만 있는 경우 제외
+        if re.fullmatch(
+            r"\d+(?:\.\d+)?(?:정|캡슐|캡슬)",
+            normalized_name,
+        ):
             continue
 
         # OCR 오타 보정: 캡슬 → 캡슐
@@ -522,21 +573,18 @@ def parse_prescription_text(text: str):
 
         match_result = match_medicine_name(medicine_name)
 
-        # 실제 의약품 DB와 유사도가 너무 낮으면
-        # 환자명/주소/금액 등 OCR 오탐으로 보고 제외한다.
-        if not bool(
-            match_result.get(
-                "isValidMedicine",
-                False,
-            )
-        ):
+        # 실제 의약품 DB와 매칭되었는지 확인
+        is_valid_medicine = bool(
+            match_result.get("isValidMedicine",False,)
+        )
+
+        if not is_valid_medicine:
             print(
-                "[DRUG MATCH] 제외:",
+                "[DRUG MATCH] 검토 필요:",
                 medicine_name,
                 "score=",
                 match_result.get("score", 0.0),
             )
-            continue
 
         matched_name = str(
             match_result.get(
@@ -553,10 +601,13 @@ def parse_prescription_text(text: str):
             or 0.0
         )
 
-        auto_corrected = bool(
-            match_result.get(
-                "autoCorrected",
-                False,
+        auto_corrected = (
+            is_valid_medicine
+            and bool(
+                match_result.get(
+                    "autoCorrected",
+                    False,
+                )
             )
         )
 
@@ -579,6 +630,7 @@ def parse_prescription_text(text: str):
             daily_count <= 0
             or period <= 0
             or match_needs_review
+            or not is_valid_medicine
         )
 
         total_count = 0
@@ -606,6 +658,13 @@ def parse_prescription_text(text: str):
             "totalCount": total_count,
             "needsReview": needs_review,
             "rawLine": current_line,
+            "isValidMedicine": is_valid_medicine,
+            "itemSeq": (
+                match_result.get("itemSeq")
+                if auto_corrected
+                else None
+            ),
+            "isValidMedicine": is_valid_medicine,
         }
 
         if (

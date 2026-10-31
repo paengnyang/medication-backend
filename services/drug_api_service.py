@@ -104,7 +104,7 @@ def search_drug_by_name(
     response = requests.get(
         MFDS_DRUG_API_URL,
         params=params,
-        timeout=15,
+        timeout=25,
     )
 
     print(
@@ -287,7 +287,7 @@ def get_drug_detail_by_item_seq(
     response = requests.get(
         MFDS_DRUG_DETAIL_API_URL,
         params=params,
-        timeout=15,
+        timeout=25,
     )
 
     print(

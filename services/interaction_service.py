@@ -3,6 +3,7 @@ import json
 import hashlib
 import os
 import re
+import time
 from datetime import date
 from datetime import (
     datetime,
@@ -26,6 +27,7 @@ from services.medicine_detail_cache import (
     fetch_medicine_detail_cached,
     save_medicine_detail_cache,
 )
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 load_dotenv()
 # ============================================================
@@ -85,6 +87,7 @@ DUR_API_KEY = (
     or ""
 ).strip()
 _dur_dataset_cache = {}
+DUR_DATASET_CACHE_HOURS = 24
 # Encoding 키를 저장해둔 경우
 # urlencode에서 이중 인코딩되지 않도록 한 번 decode
 DUR_API_KEY = unquote(
@@ -406,16 +409,27 @@ def _search_drug_detail_by_name(
                 matched = drug
                 break
 
-        # 결과가 하나뿐이면 사용
+        # 결과가 하나이고, 검색한 이름으로 시작할 때만 사용
         if (
             matched is None
             and len(medicines) == 1
-            and isinstance(
-                medicines[0],
-                dict,
-            )
+            and isinstance(medicines[0], dict)
         ):
-            matched = medicines[0]
+            only_drug = medicines[0]
+
+            result_name = _safe_string(
+                only_drug.get("itemName")
+            )
+
+            normalized_result = (
+                result_name.replace(" ", "").lower()
+            )
+
+            if (
+                target
+                and normalized_result.startswith(target)
+            ):
+                matched = only_drug
 
         if matched is None:
             return None
@@ -436,9 +450,19 @@ def _search_drug_detail_by_name(
         if not item_seq:
             return None
 
-        return _get_drug_detail(
-            item_seq
+        detail = fetch_medicine_detail_cached(
+        item_seq=item_seq,
+        fetcher=_get_drug_detail,
         )
+
+        if not isinstance(detail, dict):
+            return None
+
+        # 검색으로 확인한 품목번호를 상세정보에도 보존
+        detail = dict(detail)
+        detail["itemSeq"] = item_seq
+
+        return detail
 
     except Exception as e:
         print(
@@ -599,135 +623,154 @@ def _extract_dur_total_count(
     ):
         return 0
 
-def _load_dur_dataset(
-    endpoint_name
-):
-    """
-    DUR 데이터를 전부 받아 캐시에 저장한다.
+def _load_dur_dataset(endpoint_name):
+    """식약처 DUR 전체 데이터셋을 완전히 조회했을 때만 성공 및 캐시 저장."""
 
-    같은 서버 실행 중에는
-    두 번째부터 API를 다시 호출하지 않는다.
-    """
-
-    cached = (
-        _dur_dataset_cache.get(
-            endpoint_name
-        )
-    )
+    now = datetime.now(timezone.utc)
+    cached = _dur_dataset_cache.get(endpoint_name)
 
     if cached is not None:
-        return {
-            "success": True,
-            "items": cached,
-            "error": None,
-        }
+        expires_at, items = cached
+        if now < expires_at:
+            return {
+                "success": True,
+                "items": items,
+                "error": None,
+            }
+        _dur_dataset_cache.pop(endpoint_name, None)
 
     if not DUR_API_KEY:
         return {
             "success": False,
             "items": [],
-            "error":
-                "DUR API 인증키가 없습니다.",
+            "error": "DUR API 인증키가 없습니다.",
         }
 
     page = 1
-    page_size = 1000
-
+    page_size = 500
+    max_pages = 100
     all_items = []
+    expected_total = None
+    seen_pages = set()
 
     try:
-        while True:
-
+        while page <= max_pages:
             params = {
-                "serviceKey":
-                    DUR_API_KEY,
-
-                "type":
-                    "json",
-
-                "pageNo":
-                    page,
-
-                "numOfRows":
-                    page_size,
+                "serviceKey": DUR_API_KEY,
+                "type": "json",
+                "pageNo": page,
+                "numOfRows": page_size,
             }
-
             url = (
-                f"{DUR_BASE_URL}/"
-                f"{endpoint_name}"
+                f"{DUR_BASE_URL}/{endpoint_name}"
                 f"?{urlencode(params)}"
             )
 
-            print(
-                "[DUR DATASET]",
-                endpoint_name,
-                "page:",
-                page,
-            )
+            with urlopen(url, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
 
-            with urlopen(
-                url,
-                timeout=30,
-            ) as response:
+            if not isinstance(data, dict):
+                raise ValueError("DUR API 응답이 JSON 객체가 아닙니다.")
 
-                body = (
-                    response
-                    .read()
-                    .decode(
-                        "utf-8"
-                    )
+            root = data.get("response", data)
+            if not isinstance(root, dict):
+                raise ValueError("DUR API response 형식 오류")
+
+            header = root.get("header")
+            body = root.get("body")
+            if not isinstance(header, dict) or not isinstance(body, dict):
+                raise ValueError("DUR API header/body 누락")
+
+            result_code = str(header.get("resultCode", "")).strip()
+            if result_code not in ("00", "0"):
+                raise RuntimeError(
+                    f"DUR API 오류: {result_code} / "
+                    f"{header.get('resultMsg', '')}"
                 )
 
-            data = json.loads(
-                body
-            )
+            # 전체 건수가 누락되면 완전 조회 여부를 판단할 수 없다.
+            try:
+                total_count = int(body["totalCount"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("DUR API totalCount 누락 또는 형식 오류")
+            if total_count < 0:
+                raise ValueError("DUR API totalCount가 음수입니다.")
 
-            items = (
-                _extract_dur_items(
-                    data
+            if expected_total is None:
+                expected_total = total_count
+            elif expected_total != total_count:
+                raise ValueError(
+                    f"DUR API 전체 건수 변경: "
+                    f"{expected_total} -> {total_count}"
                 )
-            )
 
-            total_count = (
-                _extract_dur_total_count(
-                    data
+            returned_page = body.get("pageNo")
+            if returned_page is not None and str(returned_page) != str(page):
+                raise ValueError(
+                    f"DUR API 페이지 불일치: 요청 {page}, 응답 {returned_page}"
                 )
-            )
 
-            all_items.extend(
-                items
-            )
+            items = _extract_dur_items(data)
 
-            print(
-                "[DUR DATASET]",
-                len(all_items),
-                "/",
-                total_count,
-            )
+            # totalCount=0은 결과가 실제로 0건일 때만 성공 가능.
+            if expected_total == 0:
+                if items:
+                    raise ValueError("DUR API totalCount=0인데 items가 있습니다.")
+                break
 
             if not items:
+                raise ValueError(
+                    f"DUR API {page}페이지 결과 누락: "
+                    f"{len(all_items)}/{expected_total}건 수집"
+                )
+
+            # API가 이전 페이지를 되돌리는 경우 중복 누적 방지.
+            signature = hashlib.sha256(
+                json.dumps(
+                    items,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if signature in seen_pages:
+                raise ValueError(f"DUR API {page}페이지 중복 반환")
+            seen_pages.add(signature)
+
+            all_items.extend(items)
+            collected = len(all_items)
+
+            if collected > expected_total:
+                raise ValueError(
+                    f"DUR API 수집 건수 초과: {collected}/{expected_total}"
+                )
+            if collected == expected_total:
                 break
 
-            if (
-                total_count > 0
-                and len(all_items)
-                >= total_count
-            ):
-                break
-
-            if len(items) < page_size:
-                break
-
+            # 한 페이지가 500건 미만이어도 전체 건수가 남으면 계속 조회.
             page += 1
+        else:
+            raise ValueError(
+                f"DUR API 페이지 제한 {max_pages} 초과: "
+                f"{len(all_items)}/{expected_total}건 수집"
+            )
 
-            # 비정상 응답으로 무한루프 방지
-            if page > 100:
-                break
+        if len(all_items) != expected_total:
+            raise ValueError(
+                f"DUR API 불완전 수집: "
+                f"{len(all_items)}/{expected_total}건"
+            )
 
-        _dur_dataset_cache[
-            endpoint_name
-        ] = all_items
-
+        # 온전한 스냅샷만 캐시에 넣는다.
+        _dur_dataset_cache[endpoint_name] = (
+            datetime.now(timezone.utc)
+            + timedelta(hours=DUR_DATASET_CACHE_HOURS),
+            all_items,
+        )
+        print(
+            f"[DUR DATASET] COMPLETE: {endpoint_name} "
+            f"{len(all_items)}/{expected_total}건"
+        )
         return {
             "success": True,
             "items": all_items,
@@ -735,13 +778,12 @@ def _load_dur_dataset(
         }
 
     except Exception as e:
-
         print(
             "[DUR DATASET ERROR]",
             endpoint_name,
+            type(e).__name__,
             str(e),
         )
-
         return {
             "success": False,
             "items": [],
@@ -872,7 +914,7 @@ def _get_user_age(
             day,
         )
 
-        today = date.today()
+        today = datetime.now(KST).date()
 
         age = (
             today.year
@@ -1054,11 +1096,8 @@ def _check_pregnancy_dur(
     user_id,
     medicine_name,
     ingredients,
+    item_seq,
 ):
-    """
-    사용자 임신 여부와
-    식약처 DUR 임부금기 데이터를 비교한다.
-    """
 
     user_status = (
         _get_user_pregnancy_status(
@@ -1171,26 +1210,53 @@ def _check_pregnancy_dur(
 
     matched_items = []
 
-    for item in dataset.get(
-        "items",
-        [],
-    ):
-        if not isinstance(
-            item,
-            dict,
-        ):
+    seen_rules = set()
+
+    target_seq = _safe_string(item_seq)
+    target_name = _normalize_for_match(medicine_name)
+
+    for item in dataset.get("items", []):
+        if not isinstance(item, dict):
             continue
 
-        if _dur_item_matches_drug(
-            item,
-            medicine_name,
-            ingredients,
-        ):
-            matched_items.append(
-                item
-            )
+        source_seq = _safe_string(
+            item.get("ITEM_SEQ")
+        )
+
+        source_name = _normalize_for_match(
+            item.get("ITEM_NAME")
+        )
+
+        # 1. 품목번호가 모두 존재하면 정확히 비교
+        if target_seq and source_seq:
+            if target_seq != source_seq:
+                continue
+
+        # 2. 품목번호가 없는 경우 제품명으로 비교
+        elif target_name and source_name:
+            if target_name != source_name:
+                continue
+
+        else:
+            continue
+
+        # 3. 동일한 임부금기 규칙 중복 제거
+        rule_key = (
+            _safe_string(item.get("INGR_CODE")),
+            _safe_string(item.get("PROHBT_CONTENT")),
+            _safe_string(item.get("REMARK")),
+            _safe_string(item.get("NOTIFICATION_DATE")),
+            _safe_string(item.get("TYPE_NAME")),
+        )
+
+        if rule_key in seen_rules:
+            continue
+
+        seen_rules.add(rule_key)
+        matched_items.append(item)
 
     warnings = []
+
 
     for item in matched_items:
 
@@ -1310,15 +1376,8 @@ def _check_pregnancy_dur(
 def _check_dosage_dur(
     medicine_name,
     ingredients,
+    item_seq,
 ):
-    """
-    식약처 DUR 용량주의 데이터에서
-    현재 약이 용량주의 대상인지 확인한다.
-
-    현재 단계에서는 실제 복용량 초과 여부가 아니라
-    'DUR 용량주의 대상 품목인지'를 판정한다.
-    """
-
     dataset = (
         _load_dur_dataset(
             DUR_DOSAGE_ENDPOINT
@@ -1339,25 +1398,42 @@ def _check_dosage_dur(
         }
 
     matched_items = []
+    seen_rules = set()
+    target_seq = _safe_string(item_seq)
+    target_name = _normalize_for_match(medicine_name)
 
-    for item in dataset.get(
-        "items",
-        [],
-    ):
-        if not isinstance(
-            item,
-            dict,
-        ):
+    for item in dataset.get("items", []):
+        if not isinstance(item,dict):
             continue
 
-        if _dur_item_matches_drug(
-            item,
-            medicine_name,
-            ingredients,
-        ):
-            matched_items.append(
-                item
-            )
+        item_seq_value = _safe_string(
+            item.get("ITEM_SEQ")
+        )
+
+        item_name_value = _normalize_for_match(
+            item.get("ITEM_NAME")
+        )
+
+        # 품목번호 우선 비교
+        if target_seq:
+            if item_seq_value != target_seq:
+                continue
+        else:
+            if item_name_value != target_name:
+                continue
+
+        rule_key = (
+            _safe_string(item.get("INGR_CODE")),
+            _safe_string(item.get("PROHBT_CONTENT")),
+            _safe_string(item.get("REMARK")),
+            _safe_string(item.get("NOTIFICATION_DATE")),
+        )
+
+        if rule_key in seen_rules:
+            continue
+
+        seen_rules.add(rule_key)
+        matched_items.append(item)
 
     warnings = []
 
@@ -1968,16 +2044,14 @@ def _age_rule_applies(
     # 정확한 숫자가 없는 경우
     return None
 
+
 def _check_age_dur(
     user_id,
     medicine_name,
     ingredients,
+    item_seq,
 ):
-    age_info = (
-        _get_user_age(
-            user_id
-        )
-    )
+    age_info = _get_user_age(user_id)
 
     if age_info is None:
         return {
@@ -1985,308 +2059,382 @@ def _check_age_dur(
             "age": None,
             "warnings": [],
             "reviewRules": [],
-            "error":
-                "사용자 생년월일을 "
-                "확인할 수 없습니다.",
+            "error": "사용자 생년월일을 확인할 수 없습니다.",
         }
 
-    dataset = (
-        _load_dur_dataset(
-            DUR_AGE_ENDPOINT
-        )
-    )
+    dataset = _load_dur_dataset(DUR_AGE_ENDPOINT)
 
-    if not dataset.get(
-        "success"
-    ):
+    if not dataset.get("success"):
         return {
             "success": False,
-            "age":
-                age_info["age"],
+            "age": age_info["age"],
             "warnings": [],
             "reviewRules": [],
-            "error":
-                dataset.get(
-                    "error"
-                ),
+            "error": dataset.get("error"),
         }
 
-    matched_items = []
+    target_seq = _safe_string(item_seq)
+    target_name = _normalize_for_match(medicine_name)
 
-    for item in dataset.get(
-        "items",
-        [],
-    ):
-        if not isinstance(
-            item,
-            dict,
-        ):
+    matched_items = []
+    seen_rules = set()
+
+    for item in dataset.get("items", []):
+        if not isinstance(item, dict):
             continue
 
-        if _dur_item_matches_drug(
-            item,
-            medicine_name,
-            ingredients,
-        ):
-            matched_items.append(
-                item
-            )
+        source_seq = _safe_string(item.get("ITEM_SEQ"))
+        source_name = _normalize_for_match(
+            item.get("ITEM_NAME")
+        )
+
+        # 품목번호가 존재하면 품목번호로 비교
+        if target_seq and source_seq:
+            if target_seq != source_seq:
+                continue
+        elif target_name and source_name:
+            if target_name != source_name:
+                continue
+        else:
+            # 식별할 수 없는 규칙은 자동 판정에서 제외
+            continue
+
+        # 동일 규칙 중복 제거
+        rule_key = (
+            _safe_string(item.get("INGR_CODE")),
+            _safe_string(item.get("PROHBT_CONTENT")),
+            _safe_string(item.get("REMARK")),
+            _safe_string(item.get("NOTIFICATION_DATE")),
+        )
+
+        if rule_key in seen_rules:
+            continue
+
+        seen_rules.add(rule_key)
+        matched_items.append(item)
 
     warnings = []
     review_rules = []
 
     for item in matched_items:
-
-        content = (
-            _safe_string(
-                item.get(
-                    "PROHBT_CONTENT"
-                )
-            )
+        content = _safe_string(
+            item.get("PROHBT_CONTENT")
+        )
+        remark = _safe_string(
+            item.get("REMARK")
         )
 
-        remark = (
-            _safe_string(
-                item.get(
-                    "REMARK"
-                )
-            )
-        )
+        rule_text = f"{content} {remark}".strip()
 
-        rule_text = (
-            f"{content} {remark}"
-        ).strip()
-
-        applies = (
-            _age_rule_applies(
-                age_info["age"],
-                age_info[
-                    "ageMonths"
-                ],
-                rule_text,
-            )
+        applies = _age_rule_applies(
+            age_info["age"],
+            age_info["ageMonths"],
+            rule_text,
         )
 
         warning = {
-            "type":
-                "dur_age_contraindication",
-
-            "severity":
-                "danger",
-
-            "medicineName":
-                medicine_name,
-
-            "ingredient":
-                (
-                    item.get(
-                        "INGR_NAME"
-                    )
-                    or item.get(
-                        "INGR_KOR_NAME"
-                    )
-                    or ""
-                ),
-
-            "userAge":
-                age_info["age"],
-
-            "prohibition":
-                content,
-
-            "remark":
-                remark,
-
-            "notificationDate":
-                _safe_string(
-                    item.get(
-                        "NOTIFICATION_DATE"
-                    )
-                ),
+            "type": "dur_age_contraindication",
+            "severity": "danger",
+            "medicineName": medicine_name,
+            "ingredient": (
+                item.get("INGR_NAME")
+                or item.get("INGR_KOR_NAME")
+                or ""
+            ),
+            "userAge": age_info["age"],
+            "prohibition": content,
+            "remark": remark,
+            "notificationDate": _safe_string(
+                item.get("NOTIFICATION_DATE")
+            ),
         }
 
         if applies is True:
-
             warning["message"] = (
-                f"현재 사용자는 만 "
-                f"{age_info['age']}세이며, "
-                f"{medicine_name}은 "
-                "식약처 DUR 특정연령대 "
+                f"현재 사용자는 만 {age_info['age']}세이며, "
+                f"{medicine_name}은 식약처 DUR 특정연령대 "
                 "금기에 해당합니다."
             )
-
-            warnings.append(
-                warning
-            )
+            warnings.append(warning)
 
         elif applies is None:
-
-            warning[
-                "severity"
-            ] = "review"
-
-            warning[
-                "message"
-            ] = (
-                "특정연령대 금기 정보가 "
-                "있지만 자동으로 정확한 "
-                "연령 조건을 판정할 수 "
-                "없는 문구입니다."
+            warning["severity"] = "review"
+            warning["message"] = (
+                "해당 의약품에 특정연령대 주의 정보가 "
+                "있지만 연령 조건을 자동으로 "
+                "확정할 수 없어 확인이 필요합니다."
             )
-
-            review_rules.append(
-                warning
-            )
+            review_rules.append(warning)
 
     return {
         "success": True,
-
-        "age":
-            age_info["age"],
-
-        "ageMonths":
-            age_info[
-                "ageMonths"
-            ],
-
-        "matchedRuleCount":
-            len(
-                matched_items
-            ),
-
-        "warnings":
-            warnings,
-
-        "reviewRules":
-            review_rules,
-
+        "age": age_info["age"],
+        "ageMonths": age_info["ageMonths"],
+        "matchedRuleCount": len(matched_items),
+        "warnings": warnings,
+        "reviewRules": review_rules,
         "error": None,
     }
+
+
 
 def _call_dur_interaction_api(
     drug_a,
     drug_b,
+    candidate_item_seq=None,
+    current_item_seq=None,
 ):
-    """
-    식약처 DUR 병용금기 API 조회.
+    """전체 페이지와 양방향 병용금기 조회."""
 
-    drug_a:
-        기준 약
+    drug_a = _safe_string(drug_a).strip()
+    drug_b = _safe_string(drug_b).strip()
 
-    drug_b:
-        함께 복용할 약
-    """
+    candidate_item_seq = _safe_string(
+        candidate_item_seq
+    ).strip()
 
-    drug_a = _safe_string(
-        drug_a
-    )
-
-    drug_b = _safe_string(
-        drug_b
-    )
+    current_item_seq = _safe_string(
+        current_item_seq
+    ).strip()
 
     if not drug_a or not drug_b:
         return {
             "success": False,
             "items": [],
-            "error":
-                "약 이름이 비어 있습니다.",
+            "error": "약 이름이 없습니다.",
+        }
+
+    if not candidate_item_seq or not current_item_seq:
+        return {
+            "success": False,
+            "items": [],
+            "error": "품목번호가 없어 정확한 병용금기 검사가 불가능합니다.",
         }
 
     if not DUR_API_KEY:
         return {
             "success": False,
             "items": [],
-            "error":
-                "DUR API 인증키가 "
-                "설정되어 있지 않습니다.",
+            "error": "DUR API 인증키가 없습니다.",
         }
 
-    params = {
-        "serviceKey":
-            DUR_API_KEY,
+    page_size = 500
+    max_pages_per_direction = 10
 
-        "type":
-            "json",
+    # 병용금기 조회 전체에 허용할 최대 시간
+    deadline = time.monotonic() + 40
 
-        "pageNo":
-            1,
+    matched = []
+    seen_matched = set()
 
-        "numOfRows":
-            100,
-
-        "itemName":
-            drug_a,
-
-        "mixtureItemName":
-            drug_b,
-    }
-
-    url = (
-        DUR_API_URL
-        + "?"
-        + urlencode(params)
-    )
+    directions = [
+        (drug_a, drug_b, candidate_item_seq),
+        (drug_b, drug_a, current_item_seq),
+    ]
 
     try:
-        print(
-            "[DUR] 병용금기 조회:",
-            drug_a,
-            "+",
-            drug_b,
-        )
+        for base_name, mixture_name, base_item_seq in directions:
 
-        with urlopen(
-            url,
-            timeout=20,
-        ) as response:
+            page_no = 1
+            read_rows = 0
+            expected_total = None
+            seen_pages = set()
 
-            body = (
-                response
-                .read()
-                .decode(
-                    "utf-8"
+            while True:
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "병용금기 API 조회 제한 시간 초과"
+                    )
+
+                if page_no > max_pages_per_direction:
+                    raise ValueError(
+                        "DUR 조회 페이지 제한 초과: "
+                        f"{base_name} + {mixture_name}"
+                    )
+
+                params = {
+                    "serviceKey": DUR_API_KEY,
+                    "type": "json",
+                    "pageNo": page_no,
+                    "numOfRows": page_size,
+                    "itemSeq": base_item_seq,
+                }
+
+                url = DUR_API_URL + "?" + urlencode(params)
+
+                with urlopen(
+                    url,
+                    timeout=min(12, max(0.1, remaining)),
+                ) as response:
+                    data = json.loads(
+                        response.read().decode("utf-8")
+                    )
+
+                if not isinstance(data, dict):
+                    raise ValueError(
+                        "DUR API 응답이 JSON 객체가 아닙니다."
+                    )
+
+                root = data.get("response", data)
+
+                if not isinstance(root, dict):
+                    raise ValueError(
+                        "DUR API response 형식 오류"
+                    )
+
+                header = root.get("header")
+                body = root.get("body")
+
+                if (
+                    not isinstance(header, dict)
+                    or not isinstance(body, dict)
+                ):
+                    raise ValueError(
+                        "DUR API header/body 누락"
+                    )
+
+                result_code = str(
+                    header.get("resultCode", "")
+                ).strip()
+
+                if result_code not in {"00", "0"}:
+                    raise ValueError(
+                        f"DUR API 오류: {result_code}, "
+                        f"{header.get('resultMsg', '')}"
+                    )
+
+                try:
+                    total_count = int(body["totalCount"])
+                except (KeyError, TypeError, ValueError):
+                    raise ValueError(
+                        "DUR API totalCount 오류"
+                    )
+
+                if page_no == 1:
+                    print(
+                        "[DUR FILTER CHECK]",
+                        f"drug_a={base_name}",
+                        f"drug_b={mixture_name}",
+                        f"totalCount={total_count}",
+                        f"returnedRows={len(_extract_dur_items(data))}",
+                    )
+
+                if expected_total is None:
+                    expected_total = total_count
+                elif expected_total != total_count:
+                    raise ValueError(
+                        "조회 도중 totalCount 변경"
+                    )
+
+                returned_page = body.get("pageNo")
+
+                if (
+                    returned_page is not None
+                    and str(returned_page) != str(page_no)
+                ):
+                    raise ValueError(
+                        "DUR API 페이지 번호 불일치"
+                    )
+
+                page_items = _extract_dur_items(data)
+
+                if total_count > read_rows and not page_items:
+                    raise ValueError(
+                        "DUR API 결과가 중간에 끊겼습니다."
+                    )
+
+                signature = hashlib.sha256(
+                    json.dumps(
+                        page_items,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                if signature in seen_pages and page_items:
+                    raise ValueError(
+                        "DUR API 동일 페이지 반복 반환"
+                    )
+
+                seen_pages.add(signature)
+                read_rows += len(page_items)
+
+                if read_rows > total_count:
+                    raise ValueError(
+                        "DUR API 결과 수 초과"
+                    )
+
+                pair_items = _filter_dur_pair_items(
+                    page_items,
+                    candidate_item_seq,
+                    current_item_seq,
                 )
-            )
 
-        data = json.loads(
-            body
-        )
+                for item in pair_items:
+                    fingerprint = json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
 
-        items = (
-            _extract_dur_items(
-                data
-            )
-        )
+                    if fingerprint not in seen_matched:
+                        seen_matched.add(fingerprint)
+                        matched.append(item)
 
-        print(
-            "[DUR] 결과:",
-            len(items),
-            "건",
-        )
+                # 정확한 두 품목번호의 병용금기를 발견했다면
+                # 이미 확인된 위험 경고를 즉시 반환
+                if matched:
+                    print(
+                        "[DUR] 병용금기 발견, ", "추가 조회 생략:",
+                        candidate_item_seq,
+                        current_item_seq,
+                    )
+
+                    return {
+                        "success": True,
+                        "items": matched,
+                        "error": None,
+                        "queryComplete": False,
+                        "matchFound": True,
+                    }
+
+
+                print(
+                    f"[DUR] {base_name} + {mixture_name} "
+                    f"{page_no}페이지 "
+                    f"누적 {read_rows}/{total_count}"
+                )
+
+                if read_rows == total_count:
+                    break
+
+                page_no += 1
 
         return {
             "success": True,
-            "items": items,
+            "items": matched,
             "error": None,
+            "queryComplete": True,
+            "matchFound": bool(matched),
         }
 
     except Exception as e:
-
         print(
-            "[DUR]"
-            " 병용금기 API 오류:",
-            drug_a,
-            drug_b,
+            "[DUR] 병용금기 전체 조회 실패:",
+            type(e).__name__,
             str(e),
         )
 
         return {
             "success": False,
             "items": [],
-            "error":
-                str(e),
+            "error": str(e),
         }
+
 
 def _normalize_dur_warning(
     item,
@@ -2488,79 +2636,244 @@ def _save_dur_cache(user_id, cache_id, names, result):
     )
 
 
+def _filter_dur_pair_items(
+    items,
+    candidate_item_seq,
+    current_item_seq,
+):
+    """실제 검사 중인 두 품목의 병용금기만 반환."""
 
-def _check_dur_pair(user_id, candidate_name, current_name):
-    names, cache_id = _dur_pair_key(
+    expected = {
+        str(candidate_item_seq or "").strip(),
+        str(current_item_seq or "").strip(),
+    }
+
+    if "" in expected or len(expected) != 2:
+        return []
+
+    matched = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        item_a = str(
+            item.get("ITEM_SEQ") or ""
+        ).strip()
+
+        item_b = str(
+            item.get("MIXTURE_ITEM_SEQ") or ""
+        ).strip()
+
+        if {item_a, item_b} == expected:
+            matched.append(item)
+
+    return matched
+
+
+
+
+def _check_dur_pair(
+    user_id,
+    candidate_name,
+    current_name,
+    candidate_item_seq,
+    current_item_seq,
+):
+    """전체 조회 캐시와 조기 양성 캐시를 분리한다."""
+
+    names, _ = _dur_pair_key(
         candidate_name,
         current_name,
     )
 
-    drug_a, drug_b = names
+    seq_a = _safe_string(candidate_item_seq).strip()
+    seq_b = _safe_string(current_item_seq).strip()
 
-    if not drug_a or not drug_b:
+        # 같은 품목은 병용금기 쌍 검사에서 제외
+    if seq_a and seq_b and seq_a == seq_b:
+        return {
+            "success": True,
+            "direction": "same_product_skipped",
+            "items": [],
+            "queryComplete": True,
+            "matchFound": False,
+            "error": None,
+        }
+
+    # 필수 정보 누락
+    if not all(names) or not seq_a or not seq_b:
         return {
             "success": False,
             "direction": None,
             "items": [],
-            "error": "약 이름이 비어 있습니다.",
+            "queryComplete": False,
+            "matchFound": False,
+            "error": "약 이름 또는 품목번호가 누락되었습니다.",
         }
 
-    # 1. 사용자별 기존 검사 결과 조회
-    try:
-        cached = _get_dur_cache(user_id, cache_id)
-
-        if cached is not None:
-            print(
-                "[DUR] 캐시 사용:",
-                drug_a,
-                "+",
-                drug_b,
-            )
-            return cached
-
-    except Exception as e:
-        print(
-            "[DUR] 캐시 조회 실패:",
-            type(e).__name__,
+    # 조회 방식별로 서로 다른 Firestore 캐시 키 사용
+    def cache_key(mode):
+        raw = json.dumps(
+            {
+                "version": "dur_pair_cache_v5",
+                "mode": mode,
+                "names": names,
+                "itemSeqs": sorted([seq_a, seq_b]),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
         )
 
-    # 2. 외부 DUR API 한 방향만 조회
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
+    # 1. 기존 캐시 확인
+    for mode in ("complete", "early_positive"):
+        try:
+            cached = _get_dur_cache(
+                user_id,
+                cache_key(mode),
+            )
+
+        except Exception as exc:
+            print(
+                "[DUR CACHE] 조회 실패:",
+                type(exc).__name__,
+                str(exc),
+            )
+            continue
+
+        if (
+            not isinstance(cached, dict)
+            or cached.get("success") is not True
+        ):
+            continue
+
+        # 캐시 내용도 품목번호로 다시 필터링
+        items = _filter_dur_pair_items(
+            cached.get("items", []),
+            seq_a,
+            seq_b,
+        )
+
+        # 전체 조회를 완료한 캐시
+        if (
+            mode == "complete"
+            and cached.get("queryComplete") is True
+        ):
+            print(
+                "[DUR CACHE] COMPLETE HIT:",
+                seq_a,
+                seq_b,
+            )
+
+            return {
+                **cached,
+                "items": items,
+                "matchFound": bool(items),
+                "direction": "cached_complete",
+            }
+
+        # 조기 탐지한 병용금기 양성 캐시
+        if (
+            mode == "early_positive"
+            and cached.get("queryComplete") is False
+            and cached.get("matchFound") is True
+            and items
+        ):
+            print(
+                "[DUR CACHE] EARLY POSITIVE HIT:",
+                seq_a,
+                seq_b,
+            )
+
+            return {
+                **cached,
+                "items": items,
+                "queryComplete": False,
+                "matchFound": True,
+                "direction": "cached_early_match",
+            }
+
+    # 2. 캐시가 없으면 식약처 API 호출
     api_result = _call_dur_interaction_api(
-        drug_a,
-        drug_b,
+        candidate_name,
+        current_name,
+        candidate_item_seq=seq_a,
+        current_item_seq=seq_b,
+    )
+
+    success = api_result.get("success") is True
+
+    items = (
+        _filter_dur_pair_items(
+            api_result.get("items", []),
+            seq_a,
+            seq_b,
+        )
+        if success else []
+    )
+
+    complete = (
+        success
+        and api_result.get("queryComplete") is True
+    )
+
+    early_positive = (
+        success
+        and bool(items)
+        and not complete
     )
 
     result = {
-        "success": api_result.get("success") is True,
-        "direction": "canonical_order",
-        "items": api_result.get("items", []),
+        "success": success,
+        "direction": (
+            "both_directions_full_pages"
+            if complete
+            else "early_match"
+            if early_positive
+            else "incomplete"
+        ),
+        "items": items,
         "error": api_result.get("error"),
+        "queryComplete": complete,
+        "matchFound": bool(items),
     }
 
-    # 3. 성공한 결과만 캐시에 저장
-    if result["success"]:
+    # 3. 완전 조회 또는 조기 양성만 캐시
+    if complete or early_positive:
+        mode = (
+            "complete"
+            if complete
+            else "early_positive"
+        )
+
         try:
             _save_dur_cache(
                 user_id,
-                cache_id,
+                cache_key(mode),
                 names,
                 result,
             )
 
             print(
-                "[DUR] 캐시 저장 완료:",
-                drug_a,
-                "+",
-                drug_b,
+                "[DUR CACHE] SAVED:",
+                mode,
+                seq_a,
+                seq_b,
             )
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                "[DUR] 캐시 저장 실패:",
-                type(e).__name__,
+                "[DUR CACHE] 저장 실패:",
+                type(exc).__name__,
+                str(exc),
             )
 
     return result
+
 # ============================================================
 # 성분 추출
 # ============================================================
@@ -2891,9 +3204,11 @@ def _get_current_medications(
     schedule_docs = (
         db.collection("schedules")
         .where(
+        filter=FieldFilter(
             "userId",
             "==",
             user_id,
+        )
         )
         .stream()
     )
@@ -2939,9 +3254,11 @@ def _get_current_medications(
             "stockMedicines"
         )
         .where(
-            "userId",
-            "==",
-            user_id,
+            filter=FieldFilter(
+                "userId",
+                "==",
+                user_id,
+            )
         )
         .stream()
     )
@@ -3047,8 +3364,9 @@ def check_drug_interactions(
     user_id,
     candidate_item_seq,
 ):
-    candidate = _get_drug_detail(
-        candidate_item_seq
+    candidate = fetch_medicine_detail_cached(
+        item_seq=candidate_item_seq,
+        fetcher=_get_drug_detail,
     )
 
     if candidate is None:
@@ -3074,6 +3392,7 @@ def check_drug_interactions(
             user_id,
             candidate_name,
             candidate_ingredients,
+            candidate_item_seq,
         )
     )
 
@@ -3096,6 +3415,7 @@ def check_drug_interactions(
             user_id,
             candidate_name,
             candidate_ingredients,
+            candidate_item_seq,
         )
     )
 
@@ -3110,6 +3430,7 @@ def check_drug_interactions(
         _check_dosage_dur(
             candidate_name,
             candidate_ingredients,
+            candidate_item_seq,
         )
     )
 
@@ -3246,12 +3567,59 @@ def check_drug_interactions(
                 if resolved_item_seq:
                     current_item_seq = resolved_item_seq
 
-                    # 이름 검색으로 찾은 상세정보도 캐싱
-                    if isinstance(current_detail, dict) and current_detail:
-                        save_medicine_detail_cache(
-                            item_seq=resolved_item_seq,
-                            detail=current_detail,
-                        )
+                    # 검색으로 확인한 품목번호를 기존 복용약에 저장
+                    # 다음 DUR 검사부터 약 이름 검색을 생략
+                    medicine_source = medication.get("source")
+                    medicine_doc_id = medication.get("id")
+
+                    collection_name = {
+                        "schedule": "schedules",
+                        "stock": "stockMedicines",
+                    }.get(medicine_source)
+
+                    if collection_name and medicine_doc_id:
+                        try:
+                            doc_ref = (
+                                db.collection(collection_name)
+                                .document(str(medicine_doc_id))
+                            )
+
+                            snapshot = doc_ref.get()
+
+                            if snapshot.exists:
+                                saved_data = snapshot.to_dict() or {}
+
+                                # 다른 사용자의 문서가 아닌지 확인
+                                same_user = (
+                                    str(saved_data.get("userId", ""))
+                                    == str(user_id)
+                                )
+
+                                # 기존 품목번호를 덮어쓰지 않음
+                                saved_seq = str(
+                                    saved_data.get("itemSeq") or ""
+                                ).strip()
+
+                                if same_user and not saved_seq:
+                                    doc_ref.update({
+                                        "itemSeq": resolved_item_seq
+                                    })
+
+                                    print(
+                                        "[INTERACTION] 품목번호 자동 저장:",
+                                        current_name,
+                                        resolved_item_seq,
+                                    )
+
+                        except Exception as e:
+                            # 저장 실패가 DUR 검사 자체를 중단시키지는 않음
+                            print(
+                                "[INTERACTION] 품목번호 저장 실패:",
+                                current_name,
+                                type(e).__name__,
+                                str(e),
+                            )
+
 
         # --------------------------------
         # 기존 약 성분
@@ -3328,9 +3696,16 @@ def check_drug_interactions(
             }
 
         else:
-            pair_names, pair_id = _dur_pair_key(
+            pair_names, _ = _dur_pair_key(
                 candidate_name,
                 current_name,
+            )
+            pair_id = (
+                tuple(pair_names),
+                tuple(sorted([
+                    str(candidate_item_seq or "").strip(),
+                    str(current_item_seq or "").strip(),
+                ])),
             )
 
             if pair_id in checked_dur_pairs:
@@ -3341,6 +3716,8 @@ def check_drug_interactions(
                     user_id,
                     candidate_name,
                     current_name,
+                    candidate_item_seq,
+                    current_item_seq,
                 )
 
                 checked_dur_pairs[pair_id] = dur_result
@@ -3405,49 +3782,32 @@ def check_drug_interactions(
         # =================================
 
         duplicate_keys = (
-            set(
-                candidate_ingredient_map
-                .keys()
-            )
-            & set(
-                current_ingredient_map
-                .keys()
-            )
+            set(candidate_ingredient_map.keys())
+            & set(current_ingredient_map.keys())
         )
 
-        for duplicate_key in (
-            duplicate_keys
-        ):
-            ingredient_name = (
-                candidate_ingredient_map[
-                    duplicate_key
-                ]
-            )
+        same_drug = (
+            bool(candidate_item_seq)
+            and bool(current_item_seq)
+            and str(candidate_item_seq).strip()
+                == str(current_item_seq).strip()
+        )
 
-            warnings.append(
-                {
-                    "type":
-                        "duplicate_ingredient",
+        if not same_drug:
+            for duplicate_key in duplicate_keys:
+                ingredient_name = candidate_ingredient_map[duplicate_key]
 
-                    "severity":
-                        "warning",
-
-                    "medicineName":
-                        current_name,
-
-                    "ingredient":
-                        ingredient_name,
-
+                warnings.append({
+                    "type":"duplicate_ingredient",
+                    "severity":"warning",
+                    "medicineName": current_name,
+                    "ingredient":ingredient_name,
                     "message":
                         (
-                            f"{current_name}과 "
-                            f"{candidate_name}에 "
-                            f"동일 성분 "
-                            f"'{ingredient_name}'이 "
-                            f"포함되어 있습니다."
+                            f"{current_name}과 {candidate_name}에 "
+                            f"동일 성분 '{ingredient_name}'이 포함되어 있습니다."
                         ),
-                }
-            )
+                })
 
         # =================================
         # 2. 새 약 주의사항에
@@ -3653,6 +4013,110 @@ def check_drug_interactions(
         len(dosage_warnings) > 0 or
         len(efficacy_warnings) > 0
     )
+    
+    check_errors = list(dur_errors)
+
+    for check_name, check_result in (
+        ("age", age_result),
+        ("pregnancy", pregnancy_result),
+        ("dosage", dosage_result),
+        ("efficacy", efficacy_result),
+    ):
+        if check_result.get("success") is not True:
+            check_errors.append({
+                "check": check_name,
+                "error": check_result.get("error") or "검사 실패",
+            })
+
+    if skipped_medications:
+        check_errors.append({
+            "check": "current_medications",
+            "error": "성분 정보가 없어 검사하지 못한 복용약이 있습니다.",
+        })
+
+    
+    # 임부금기 검사 대상이 아닌 경우와
+    # 임신 정보가 부족한 경우를 구분
+    pregnancy_gender = _safe_string(
+        pregnancy_result.get("gender")
+    ).strip().lower()
+
+    pregnancy_not_applicable = (
+        pregnancy_result.get("success") is True
+        and pregnancy_result.get("checked") is False
+        and pregnancy_result.get("pregnant") is None
+        and pregnancy_gender in {
+            "남",
+            "남성",
+            "male",
+            "m",
+        }
+    )
+
+    # 임부금기 검사 미완료 여부
+    pregnancy_not_evaluated = (
+        pregnancy_result.get("checked") is False
+        and not pregnancy_not_applicable
+    )
+
+    # 검사 오류와 미완료 항목이 모두 없어야 완료
+    screening_complete = (
+        not check_errors
+        and not pregnancy_not_evaluated
+    )
+
+
+    screening_complete = (
+        not check_errors
+        and not pregnancy_not_evaluated
+    )
+
+    if unique_dur_warnings:
+        screening_status = "dur_interaction_warning"
+        screening_message = "식약처 DUR 병용금기가 확인되었습니다."
+
+    elif pregnancy_warnings:
+        screening_status = "pregnancy_contraindication"
+        screening_message = "임부금기가 확인되었습니다."
+
+    elif age_warnings:
+        screening_status = "age_contraindication"
+        screening_message = "특정연령대금기가 확인되었습니다."
+
+    elif check_errors:
+        screening_status = "dur_check_incomplete"
+        screening_message = "DUR 검사 중 일부 항목을 완료하지 못했습니다."
+
+    elif age_review_rules:
+        screening_status = "age_review_required"
+        screening_message = "연령 조건에 대한 추가 확인이 필요합니다."
+
+    elif any(
+        w.get("type") == "duplicate_ingredient"
+        for w in unique_warnings
+    ):
+        screening_status = "warning_found"
+        screening_message = "동일 성분이 포함된 복용약이 있습니다."
+
+    elif unique_warnings:
+        screening_status = "warning_found"
+        screening_message = "사용상주의사항 기반 병용 경고가 있습니다."
+
+    elif efficacy_warnings:
+        screening_status = "efficacy_duplication"
+        screening_message = "동일 효능군 중복 가능성이 있습니다."
+
+    elif dosage_warnings:
+        screening_status = "dosage_caution"
+        screening_message = "DUR 용량주의 정보가 있습니다."
+
+    elif pregnancy_not_evaluated:
+        screening_status = "dur_check_incomplete"
+        screening_message = "임신 정보가 없어 임부금기를 판정하지 못했습니다."
+
+    else:
+        screening_status = "no_match_found"
+        screening_message = "조회한 DUR 항목에서 해당 경고가 확인되지 않았습니다."
 
 
     return {
@@ -3848,83 +4312,10 @@ def check_drug_interactions(
         "efficacyWarnings":
             efficacy_warnings,
 
-        # '안전'이라고 판정하지 않는다.
-        "screeningStatus":
-            (
-                "pregnancy_contraindication"
-                if pregnancy_warnings
-
-                else "age_contraindication"
-                if age_warnings
-
-                else "dosage_caution"
-                if dosage_warnings
-
-                else "efficacy_duplication"
-                if efficacy_warnings
-
-                else "dur_interaction_warning"
-                if unique_dur_warnings
-
-                else "warning_found"
-                if unique_warnings
-
-                else "dur_check_incomplete"
-                if dur_errors
-
-                else "no_match_found"
-            ),
-
-        "message":
-            (
-                "사용자의 임신 상태와 관련된"
-                "DUR 임부금기가 확인되었습니다."
-                if pregnancy_warnings
-
-                else
-                "사용자의 연령과 관련된"
-                "DUR 특정연령대금기가"
-                "확인되었습니다."
-                if age_warnings
-
-                else
-                "해당 의약품에 식약처 DUR"
-                "용량주의 정보가 있습니다."
-                if dosage_warnings
-
-                else
-                "식약처 DUR 병용금기가 "
-                "확인되었습니다."
-                if unique_dur_warnings
-
-                else
-                "동일 성분이 포함된 의약품이 "
-                "현재 복용약에 있습니다."
-                if any(
-                    warning.get("type")
-                    == "duplicate_ingredient"
-                    for warning in unique_warnings
-                )
-                
-                else
-                "사용상주의사항 기반 "
-                "병용 경고가 확인되었습니다."
-                if unique_warnings
-
-                else
-                "동일 효능군의 의약품을 "
-                "중복 복용할 가능성이 있습니다."
-                if efficacy_warnings
-
-                else
-                "DUR 검사 중 일부 약의 "
-                "조회에 실패했습니다."
-                if dur_errors
-
-                else
-                "식약처 DUR에서 직접적인 "
-                "병용금기가 확인되지 않았습니다."
-            ),
+        "screeningStatus": screening_status,
+        "message": screening_message,
+        "screeningComplete": screening_complete,
+        "checkErrors": check_errors,
 
         "notice":
             (

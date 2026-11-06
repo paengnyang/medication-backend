@@ -3386,6 +3386,8 @@ def check_drug_interactions(
             candidate
         )
     )
+    # 검사 대상 약의 성분 정보 누락 여부
+    candidate_ingredients_missing = not bool(candidate_ingredients)
 
     age_result = (
         _check_age_dur(
@@ -3494,7 +3496,8 @@ def check_drug_interactions(
     checked_medications = []
 
     skipped_medications = []
-    ##checked_dur_pairs = set()
+    # 상세정보 조회에 실패한 복용약 목록
+    detail_unavailable = []
 
     # 후보약 성분 정규화
     candidate_ingredient_map = {
@@ -3531,10 +3534,19 @@ def check_drug_interactions(
 # =================================
 
         if current_item_seq:
-            current_detail = fetch_medicine_detail_cached(
-                item_seq=current_item_seq,
-                fetcher=_get_drug_detail,
-            )
+            try:
+                current_detail = fetch_medicine_detail_cached(
+                    item_seq=current_item_seq,
+                    fetcher=_get_drug_detail,
+                )
+
+            except Exception as exc:
+                print(
+                    "[INTERACTION] 복용약 상세조회 실패:",
+                    current_name,
+                    type(exc).__name__,
+                )
+                current_detail = None
 
 
 # =================================
@@ -3633,7 +3645,16 @@ def check_drug_interactions(
                     current_detail
                 )
             )
-
+        # 상세정보가 끝내 확인되지 않았다면 검사 미완료로 기록
+        if current_detail is None:
+            detail_unavailable.append({
+                "medicineName": current_name,
+                "itemSeq": current_item_seq,
+                "error": (
+                    "복용약 상세정보를 확인하지 못해 "
+                    "사용상주의사항 검사가 미완료되었습니다."
+                ),
+            })
         # Firestore에 저장된 성분 fallback
         if not current_ingredients:
 
@@ -4015,6 +4036,26 @@ def check_drug_interactions(
     )
     
     check_errors = list(dur_errors)
+    # 검사 대상 약 성분 누락
+    if candidate_ingredients_missing:
+        check_errors.append({
+            "check": "candidate_ingredients",
+            "error": (
+                "검사 대상 의약품의 성분 정보가 없어 "
+                "성분 기반 비교를 완료하지 못했습니다."
+            ),
+        })
+
+    # 기존 복용약 상세정보 누락
+    if detail_unavailable:
+        check_errors.append({
+            "check": "current_medication_details",
+            "error": (
+                "일부 복용약의 상세정보가 없어 "
+                "사용상주의사항 검사를 완료하지 못했습니다."
+            ),
+            "medications": detail_unavailable,
+        })
 
     for check_name, check_result in (
         ("age", age_result),
@@ -4053,23 +4094,31 @@ def check_drug_interactions(
         }
     )
 
-    # 임부금기 검사 미완료 여부
+    # 임신 정보가 없어서 검사를 적용하지 못한 경우
     pregnancy_not_evaluated = (
         pregnancy_result.get("checked") is False
         and not pregnancy_not_applicable
     )
+    if (
+        pregnancy_not_evaluated
+        and pregnancy_result.get("success") is True
+    ):
+        check_errors.append({
+            "check": "pregnancy_status",
+            "error": (
+                "임신 여부 정보가 없어 "
+                "임부금기 적용 여부를 판단하지 못했습니다."
+            ),
+        })
 
-    # 검사 오류와 미완료 항목이 모두 없어야 완료
+    # 검사 오류 또는 자동 판정 불가능한 연령 규칙이 있으면
+    # 전체 검사를 완료한 것으로 표시하지 않음
     screening_complete = (
         not check_errors
         and not pregnancy_not_evaluated
+        and not age_review_rules
     )
 
-
-    screening_complete = (
-        not check_errors
-        and not pregnancy_not_evaluated
-    )
 
     if unique_dur_warnings:
         screening_status = "dur_interaction_warning"
@@ -4150,6 +4199,8 @@ def check_drug_interactions(
         # 정보 부족으로 검사 못한 약
         "skippedMedications":
             skipped_medications,
+        "detailUnavailableMedications":
+            detail_unavailable,
 
         # 새 약 자체의 공식 금기사항
         "contraindications":
